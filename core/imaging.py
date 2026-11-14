@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
+import sys
 import time
 from typing import Optional, Sequence, Tuple
 
@@ -16,6 +18,19 @@ from PIL import Image
 import config
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# خاموش کردن لاگر داخلی OpenCV
+#
+# هشدارهایی مثل «VIDEOIO(MSMF): backend can't be used to capture by index»،
+# «Camera index out of range» و «OpenCV should be configured with libavdevice»
+# مستقیماً از کد C++ به stderr چاپ می‌شوند (نه از لاگر پایتون) و با
+# logging.getLogger یا OPENCV_LOG_LEVEL خاموش نمی‌شوند. چون موقع شناسایی
+# دوربین عمداً ایندکس‌های ناموجود را هم امتحان می‌کنیم، این هشدارها طبیعی‌اند
+# و فقط کنسول را شلوغ می‌کنند.
+#
+# راه‌حل: سطح لاگر OpenCV روی SILENT گذاشته می‌شود و بعد از هر ساخت
+# VideoCapture دوباره اعمال می‌شود (به کمک _silence_cv_log).
 
 try:
     import cv2
@@ -38,6 +53,267 @@ def grab_screen() -> Image.Image:
 
 async def grab_screen_async() -> Image.Image:
     return await asyncio.to_thread(grab_screen)
+
+
+_camera_settings_cache: Optional[dict] = None
+
+
+def _load_camera_settings() -> dict:
+    """تنظیمات دوربین (index انتخاب‌شده) از settings.json."""
+    global _camera_settings_cache
+    if _camera_settings_cache is not None:
+        return _camera_settings_cache
+    data: dict = {"camera_index": 0}
+    if os.path.exists(config.SETTINGS_FILE):
+        try:
+            import json
+            with open(config.SETTINGS_FILE, "r", encoding="utf-8") as fh:
+                saved = json.load(fh)
+            if "camera_index" in saved:
+                data["camera_index"] = int(saved["camera_index"])
+        except Exception:
+            logger.exception("خواندن تنظیمات دوربین ناموفق بود")
+    _camera_settings_cache = data
+    return data
+
+
+def _save_camera_settings(data: dict) -> None:
+    global _camera_settings_cache
+    _camera_settings_cache = data
+    try:
+        import json
+        # settings.json مشترک با ai.py است؛ فقط کلید camera_index را
+        # به‌روزرسانی می‌کنیم و بقیه کلیدها (مثل provider) دست‌نخورده می‌مانند
+        full: dict = {}
+        if os.path.exists(config.SETTINGS_FILE):
+            try:
+                with open(config.SETTINGS_FILE, "r", encoding="utf-8") as fh:
+                    full = json.load(fh)
+            except Exception:
+                full = {}
+        full.update(data)
+        tmp = config.SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(full, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, config.SETTINGS_FILE)
+    except Exception:
+        logger.exception("ذخیره‌ی تنظیمات دوربین ناموفق بود")
+
+
+def saved_camera_index() -> int:
+    """ایندکس دوربین ذخیره‌شده توسط کاربر (پیش‌فرض: 0)."""
+    return _load_camera_settings().get("camera_index", 0)
+
+
+def set_camera_index(index: int) -> None:
+    """ایندکس دوربین را ذخیره می‌کند تا /camera همیشه از همان استفاده کند."""
+    data = _load_camera_settings()
+    data["camera_index"] = int(index)
+    _save_camera_settings(data)
+
+
+def _silence_cv_log() -> None:
+    """
+    سطح لاگر داخلی OpenCV را روی SILENT می‌گذارد.
+
+    OpenCV backendها را lazy بارگذاری می‌کند و هر backend موقع لود شدن
+    سطح لاگ را به مقدار پیش‌فرض برمی‌گرداند؛ برای همین باید بعد از ساخت
+    هر VideoCapture دوباره اعمال شود.
+    """
+    if not _HAS_CV2:
+        return
+    with contextlib.suppress(Exception):
+        log = cv2.utils.logging
+        level = getattr(log, "LOG_LEVEL_SILENT", None)
+        log.setLogLevel(level if level is not None else 0)
+
+
+# FFmpeg را از فهرست backendهای قابل انتخاب حذف می‌کنیم.
+#
+# نسخه‌ی prebuilt از OpenCV بدون libavdevice ساخته شده، پس FFmpeg هیچ‌وقت
+# نمی‌تواند دوربین را باز کند؛ ولی هر بار که VideoCapture ساخته می‌شود
+# امتحانش می‌کند و یک خط هشدار روی stderr می‌نویسد:
+#   «VIDEOIO/FFMPEG: OpenCV should be configured with libavdevice»
+#
+# این خط فقط سروصداست و ربطی به کار ما ندارد. با حذف کردن FFmpeg از فهرست،
+# OpenCV مستقیم سراغ backend بومی ویندوز (MSMF/obsensor) می‌رود که همان
+# چیزی است که کار می‌کند، و هشدار هم دیگر چاپ نمی‌شود.
+def _disable_ffmpeg_backend() -> None:
+    if not _HAS_CV2:
+        return
+    with contextlib.suppress(Exception):
+        cv2.setVideoCapturePriority(0, 2)  # 2 = CAP_FFMPEG
+    # روش جایگزین برای نسخه‌های قدیمی‌تر که این API را ندارند
+    with contextlib.suppress(Exception):
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+
+
+class _quiet_stderr:
+    """
+    موقتاً stderr واقعی (file descriptor) را به devnull وصل می‌کند.
+
+    چرا این‌قدر پایین؟ هشدارهای OpenCV از کد C++ نوشته می‌شوند و از
+    «sys.stderr» پایتون عبور نمی‌کنند؛ تنها راه ساکت‌کردنشان دستکاری
+    خود file descriptor است.
+
+    با تعویض sys.stderr این کار انجام نمی‌شود، چون DLL نوشتن را مستقیم
+    روی handle 2 انجام می‌دهد. این کلاس با os.dup2 کار می‌کند و در
+    finally مسیر قبلی را برمی‌گرداند، پس هیچ پیام واقعی‌ای گم نمی‌شود.
+    """
+
+    def __enter__(self) -> None:
+        self._saved_fd = -1
+        self._null_fd = -1
+        if not _HAS_CV2:
+            return
+        stderr = sys.stderr
+        # اگر stderr به جایی وصل نباشد (مثلاً pytest capture) دست نمی‌زنیم
+        try:
+            fd = stderr.fileno()
+        except Exception:
+            return
+        if not fd or fd < 2:
+            return
+        try:
+            self._saved_fd = os.dup(fd)
+            self._null_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(self._null_fd, fd)
+        except Exception:
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        for attr in ("_saved_fd", "_null_fd"):
+            fd = getattr(self, attr, -1)
+            if fd is not None and fd >= 0:
+                with contextlib.suppress(Exception):
+                    os.close(fd)
+                setattr(self, attr, -1)
+
+    def __exit__(self, *exc) -> None:
+        stderr = sys.stderr
+        if self._saved_fd is not None and self._saved_fd >= 0:
+            with contextlib.suppress(Exception):
+                fd = stderr.fileno()
+                os.dup2(self._saved_fd, fd if (fd and fd >= 2) else 2)
+        self._cleanup()
+
+
+# حذف FFmpeg و خاموش کردن لاگر در همان لحظه‌ی لود شدن ماژول، تا پیش از
+# اولین استفاده اعمال شده باشند.
+_disable_ffmpeg_backend()
+_silence_cv_log()
+
+
+def _open_camera(camera_index: int):
+    """
+    دوربین را باز می‌کند و VideoCapture برگشتی را می‌دهد (یا None).
+
+    فقط backend پیش‌فرض OpenCV استفاده می‌شود، چون روی این سیستم
+    backendهای صریح کار نمی‌کنند:
+
+      * CAP_DSHOW  → «backend is generally available but can't be used
+        to capture by index»
+      * CAP_MSMF   → همان پیام
+
+    backend پیش‌فرض (بدون آرگومان دوم) هر دو دوربین را درست باز می‌کند.
+
+    ساخت VideoCapture داخل _quiet_stderr انجام می‌شود چون OpenCV موقع
+    بارگذاری lazy هر backend (از جمله FFmpeg که در این نسخه libavdevice
+    ندارد) پیام هشدار روی stderr می‌نویسد که ربطی به کار ما ندارد.
+    """
+    try:
+        with _quiet_stderr():
+            cap = cv2.VideoCapture(camera_index)
+    except Exception:
+        return None
+    _silence_cv_log()
+    if cap.isOpened():
+        return cap
+    with contextlib.suppress(Exception):
+        cap.release()
+    return None
+
+
+def detect_cameras(max_index: int = 10) -> list:
+    """
+    همه‌ی دوربین‌های متصل به سیستم را پیدا می‌کند.
+
+    ایندکس‌ها را از 0 به بالا امتحان می‌کند و به‌محض دیدن
+    max_miss پشت‌سرهم ایندکس ناموجود متوقف می‌شود؛ دوربین‌های USB معمولاً
+    ایندکس‌های پشت‌سرهم دارند، پس ادامه دادن بعد از چند misses پشت‌سرهم
+    فقط هشدار اضافه تولید می‌کند و چیزی پیدا نمی‌کند.
+
+    خروجی: لیست dict با کلیدهای index, width, height.
+    """
+    if not _HAS_CV2:
+        raise RuntimeError("OpenCV (cv2) نصب نیست؛ دوربین در دسترس نیست.")
+    found = []
+    misses = 0
+    for idx in range(max_index):
+        cap = _open_camera(idx)
+        if cap is None:
+            misses += 1
+            if misses >= 2:
+                break
+            continue
+        try:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                misses += 1
+                if misses >= 2:
+                    break
+                continue
+            misses = 0
+            h, w = frame.shape[:2]
+            found.append({"index": idx, "width": int(w), "height": int(h)})
+        finally:
+            with contextlib.suppress(Exception):
+                cap.release()
+    return found
+
+
+async def detect_cameras_async(max_index: int = 10) -> list:
+    return await asyncio.to_thread(detect_cameras, max_index)
+
+
+def grab_camera_photo(camera_index: Optional[int] = None) -> Image.Image:
+    """
+    یک فریم از دوربین (webcam) لپ‌تاپ می‌گیرد و به PIL تبدیل می‌کند.
+
+    اگر camera_index داده نشود، از ایندکس ذخیره‌شده توسط کاربر
+    (در settings.json) استفاده می‌شود؛ پس /camera همیشه از همان
+    دوربینی که کاربر انتخاب کرده عکس می‌گیرد.
+
+    cv2.VideoCapture فریم‌های اول را معمولاً تار یا خیلی تاریک برمی‌گرداند
+    (نیاز به تنظیم نوردهی دوربین)؛ به همین دلیل چند فریم اول را دور
+    می‌ریزیم و از فریم‌های بعدی استفاده می‌کنیم.
+    """
+    if not _HAS_CV2:
+        raise RuntimeError("OpenCV (cv2) نصب نیست؛ دوربین در دسترس نیست.")
+    if camera_index is None:
+        camera_index = saved_camera_index()
+    cap = _open_camera(camera_index)
+    if cap is None:
+        raise RuntimeError(
+            f"دوربین (index={camera_index}) باز نشد؛ "
+            "شاید برنامه‌ی دیگری از آن استفاده می‌کند یا دوربین قطع است. "
+            "با دکمه‌ی «تنظیم دوربین» دوباره دوربین‌ها را شناسایی کن."
+        )
+    try:
+        # چند فریم اول را دور بریز تا نوردهی دوربین تنظیم شود
+        for _ in range(5):
+            cap.read()
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError("دوربین باز شد ولی فریمی برنگرداند.")
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+    finally:
+        cap.release()
+
+
+async def grab_camera_photo_async(camera_index: Optional[int] = None) -> Image.Image:
+    return await asyncio.to_thread(grab_camera_photo, camera_index)
 
 
 def crop_by_ratio(image: Image.Image, box: Sequence[float]) -> Optional[Image.Image]:

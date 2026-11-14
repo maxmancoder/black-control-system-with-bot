@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import sys
 import time
+import urllib.parse
 from typing import Dict, List, Optional, Tuple
 
 import telegram.error
@@ -48,6 +50,7 @@ from core import (
     opencode,
     opencode_ui,
     power,
+    remote,
     secrets,
     security,
     singleton,
@@ -98,14 +101,18 @@ HELP_TEXT = """
 
 **دکمه‌های پایین چت**
 📸 اسکرین‌شات — عکس کل صفحه (عکس + فایل خوانا)
+📷 دوربین — عکس گرفتن از دوربین لپ‌تاپ
 📂 برنامه‌ها — لیست برنامه‌های نصب‌شده با جست‌وجو
 ✍️ ساخت پرامپت — تبدیل متن خام به پرامپت منظم با AI
 🌐 تب OpenCode — تب‌های باز خود برنامه و تب جدید
 🖱 کنترل ماوس — حرکت ماوس، کلیک و تایپ از داخل چت
+🔍 گوگل — جست‌وجو در گوگل و فعال شدن کنترل ماوس روی نتایج
 ⏻ خاموش — خاموش کردن با تأیید و امکان لغو
 
 **دستورها**
 /shot — اسکرین‌شات فوری
+/camera — عکس از دوربین لپ‌تاپ (از دوربین انتخاب‌شده)
+`/camera_setup` — شناسایی دوربین‌ها و انتخاب دوربین پیش‌فرض
 /apps — لیست برنامه‌ها
 /open <نام> — باز کردن برنامه از روی نام
 /search <متن> — جست‌وجو در برنامه‌ها
@@ -114,6 +121,9 @@ HELP_TEXT = """
 /tabopencode — تب‌های باز خود برنامه‌ی OpenCode
 /send — گرفتن پرامپت از شما و فرستادن به کادر OpenCode
 /mouse — حالت کنترل ماوس و کیبورد (متن فارسی هم تایپ می‌شود)
+/google <متن> — جست‌وجو در گوگل؛ بعد از باز شدن نتایج، کنترل ماوس فعال می‌شود
+/remote — کنسول ریموت وب (استریم زنده‌ی صفحه + ماوس و کیبورد از مرورگر، با تونل کلودفلر)
+`/remote_stop` — توقف کنسول ریموت
 /approve — تأیید درخواست معلق OpenCode
 /reject — رد درخواست معلق OpenCode
 /stop — توقف کار جاری
@@ -246,8 +256,80 @@ async def cmd_shot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @security.owner_only
+async def cmd_camera(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await on_button_camera(update, context)
+
+
+@security.owner_only
+async def cmd_camera_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """شناسایی دوربین‌های متصل و نمایش لیست برای انتخاب."""
+    await _camera_detect_and_show(update, context)
+
+
+@security.owner_only
 async def on_button_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _do_screenshot(update, context)
+
+
+# ------------------------------------------------------------------ دوربین
+@security.owner_only
+async def on_button_camera(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """عکس گرفتن از دوربین لپ‌تاپ و فرستادن آن به کاربر.
+
+    همیشه از دوربین ذخیره‌شده (در settings.json) استفاده می‌شود؛
+    اگر کاربر دوربینی انتخاب نکرده باشد، ایندکس 0 (دوربین پیش‌فرض).
+    """
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    try:
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+        img = await imaging.grab_camera_photo_async()
+        saved_idx = imaging.saved_camera_index()
+        await bot.send_photo(
+            chat_id,
+            photo=imaging.encode_jpeg(img, quality=config.SCREENSHOT_JPEG_QUALITY),
+            caption=f"📷 عکس از دوربین {saved_idx}",
+            reply_markup=ui.camera_photo_keyboard(),
+        )
+    except Exception as exc:
+        logger.exception("عکس دوربین ناموفق بود")
+        await _safe_reply(
+            update.effective_message,
+            f"❌ عکس دوربین گرفته نشد:\n{exc}\n\n"
+            "با دکمه‌ی «تنظیم دوربین» زیر عکس (یا دستور /camera_setup) "
+            "دوربین‌های متصل را شناسایی و یکی را انتخاب کن.",
+        )
+
+
+async def _camera_detect_and_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """دوربین‌های متصل را شناسایی کرده و لیست انتخاب را نشان می‌دهد."""
+    try:
+        cameras = await imaging.detect_cameras_async()
+    except Exception as exc:
+        logger.exception("شناسایی دوربین ناموفق بود")
+        await _safe_reply(
+            update.effective_message,
+            f"❌ شناسایی دوربین ناموفق بود:\n{exc}",
+        )
+        return
+    if not cameras:
+        await _safe_reply(
+            update.effective_message,
+            "🔍 هیچ دوربینی شناسایی نشد. اتصال دوربین (USB یا داخلی) "
+            "و بسته‌نبودن آن توسط برنامه‌ی دیگر را بررسی کن.",
+        )
+        return
+    saved_idx = imaging.saved_camera_index()
+    lines = ["🔍 دوربین‌های شناسایی‌شده:\n"]
+    for cam in cameras:
+        mark = "✅" if cam["index"] == saved_idx else "•"
+        lines.append(f"{mark} دوربین {cam['index']} — {cam['width']}×{cam['height']}")
+    lines.append(f"\nالان دوربین {saved_idx} انتخاب است. یکی را بزن تا ذخیره شود.")
+    await _safe_reply(
+        update.effective_message,
+        "\n".join(lines),
+        reply_markup=ui.camera_select_keyboard(cameras, saved_idx),
+    )
 
 
 # ------------------------------------------------------------------ برنامه‌ها
@@ -1001,6 +1083,17 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ------------------------------------------------------------------ سرویس AI
+MODELS_PAGE_SIZE = 8
+
+
+def _provider_by_name(name: str):
+    """پیدا کردن تنظیمات یک سرویس AI از روی نام."""
+    for p in config.AI_PROVIDERS:
+        if p["name"].lower() == str(name or "").lower():
+            return p
+    return None
+
+
 @security.owner_only
 async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active = ai.active_provider()["name"]
@@ -1011,7 +1104,7 @@ async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(f"{mark}**{name}**")
         lines.append(f"    {note}")
     lines.append(
-        "\nروی هر سرویس بزن تا فعال شود و کلیدش را وارد کنی."
+        "\nروی هر سرویس بزن تا فعال شود، کلیدش را وارد کنی و مدل دلخواه را انتخاب کنی."
         "\nکلید داخل کد نوشته نمی‌شود؛ در data\\secrets.json ذخیره می‌شود و "
         "پیامِ کلید بعد از ذخیره پاک می‌شود."
     )
@@ -1021,6 +1114,87 @@ async def cmd_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=ui.provider_keyboard(active, statuses),
         parse_mode="Markdown",
     )
+
+
+async def _show_models(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    provider_name: str,
+    page: int = 0,
+    edit: bool = False,
+    notice: str = "",
+    force: bool = False,
+) -> None:
+    """نمایش لیست مدل‌های یک سرویس با فیلتر و صفحه‌بندی."""
+    session = _session(context)
+    provider = _provider_by_name(provider_name)
+    if provider is None:
+        text = "سرویس پیدا نشد."
+        if edit:
+            await _edit_callback(update, text)
+        else:
+            await _safe_reply(update.effective_message, text)
+        return
+
+    query_text = str(session.get("model_query") or "")
+    session["model_provider"] = provider_name
+    session["model_query"] = query_text
+
+    ok, all_models, err = await ai.fetch_models(provider, force=force)
+    if not ok:
+        msg = f"❌ دریافت مدل‌های «{provider_name}» ناموفق بود:\n{err}"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 تلاش دوباره", callback_data=f"models_open:{provider_name}")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"provider:{provider_name}")],
+        ])
+        if edit:
+            await _edit_query(update.callback_query, msg, reply_markup=kb)
+        else:
+            await _safe_reply(update.effective_message, msg, reply_markup=kb)
+        return
+
+    filtered = ai.filter_models(all_models, query_text)
+    if not filtered:
+        lines = [f"📋 **مدل‌های {provider_name}**", ""]
+        if notice:
+            lines.extend([notice, ""])
+        if query_text:
+            lines.append(f"نتیجه‌ای برای «{query_text}» پیدا نشد.")
+            lines.append("عبارت جست‌وجوی دیگری بفرست (مثلاً `free` برای مدل‌های رایگان) یا فیلتر را پاک کن.")
+        else:
+            lines.append("مدلی برای نمایش وجود ندارد.")
+        kb = ui.models_keyboard([], 0, 1, query_text)
+        text = "\n".join(lines)
+        if edit:
+            await _edit_query(update.callback_query, text, reply_markup=kb, parse_mode="Markdown")
+        else:
+            await _safe_reply(update.effective_message, text, reply_markup=kb, parse_mode="Markdown")
+        return
+
+    total_pages = max(1, (len(filtered) + MODELS_PAGE_SIZE - 1) // MODELS_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    session["model_page"] = page
+    start = page * MODELS_PAGE_SIZE
+    page_items = filtered[start:start + MODELS_PAGE_SIZE]
+
+    current = ai.effective_model(provider)
+    lines = [f"📋 **مدل‌های {provider_name}**"]
+    if notice:
+        lines.append(notice)
+    if query_text:
+        lines.append(f"جست‌وجو: `{query_text}`")
+    lines.append(f"تعداد: {len(filtered)} مورد — صفحه {page + 1}/{total_pages}")
+    lines.append(f"مدل فعال: `{current}`" if current else "مدل فعال: (پیش‌فرض تنظیم نشده)")
+    lines.append("")
+    lines.append("روی مدل بزن تا انتخاب شود.")
+    lines.append("برای فیلتر، «🔍 جست‌وجو» را بزن و متن را بفرست (مثلاً `free`).")
+    text = "\n".join(lines)
+
+    kb = ui.models_keyboard(page_items, page, total_pages, query_text)
+    if edit and update.callback_query is not None:
+        await _edit_query(update.callback_query, text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await _safe_reply(update.effective_message, text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def _save_api_key(
@@ -1066,21 +1240,39 @@ async def _save_api_key(
     pending = session.pop("pending_raw", "")
     ok, result = await ai.test_connection(provider)
 
-    if ok:
-        text = f"✅ اتصال به «{provider_name}» برقرار شد."
-    else:
-        text = (
-            f"⚠️ کلید ذخیره شد ولی اتصال تست نشد:\n{result}\n\n"
-            "می‌توانی سرویس دیگری را امتحان کنی."
-        )
-
     if pending:
         # کاربر قبلاً درخواست ساخت پرامپت داده بود، ادامه می‌دهیم
+        if ok:
+            text = f"✅ اتصال به «{provider_name}» برقرار شد."
+        else:
+            text = (
+                f"⚠️ کلید ذخیره شد ولی اتصال تست نشد:\n{result}\n\n"
+                "می‌توانی سرویس دیگری را امتحان کنی."
+            )
         text += "\n\nادامه‌ی ساخت پرامپت…"
         await _edit(status, text)
         await _generate_prompt(update, context, pending)
         return
 
+    if ok:
+        session["model_provider"] = provider_name
+        session["model_query"] = ""
+        session["model_page"] = 0
+        await _edit(status, f"✅ اتصال به «{provider_name}» برقرار شد.\nدر حال دریافت لیست مدل‌ها…")
+        await _show_models(
+            update,
+            context,
+            provider_name,
+            page=0,
+            edit=False,
+            notice="اتصال برقرار است؛ یک مدل را انتخاب کن.",
+        )
+        return
+
+    text = (
+        f"⚠️ کلید ذخیره شد ولی اتصال تست نشد:\n{result}\n\n"
+        "می‌توانی سرویس دیگری را امتحان کنی یا مدل/تنظیمات را بررسی کنی."
+    )
     await _edit(
         status,
         text,
@@ -1139,7 +1331,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         jobs.queue.status_line(),
         f"OpenCode فعال: {'بله' if opencode.is_running() else 'خیر'}",
         f"سرویس AI فعال: {provider['name']}",
-        f"مدل: {provider['model']}",
+        f"مدل: {ai.effective_model(provider)}",
         f"کلید API: {'ثبت شده' if src != 'none' else 'ثبت نشده'} "
         f"({src if src != 'none' else 'از /provider وارد کنید'})",
         f"تعداد برنامه‌های شناسایی‌شده: {len(context.user_data.get('all_apps', []))}",
@@ -1182,6 +1374,11 @@ async def on_button_apps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ------------------------------------------------------------------ کنترل ماوس
 _MOUSE_MODE = "mouse"
+# حالت «منتظر متن برای چسباندن در مکان سلکت‌شده» — بعد از خروج از حالت ماوس
+# با دکمه‌ی «وارد کردن متن…» فعال می‌شود.
+_MOUSE_TYPE_MODE = "mouse_type"
+# حالت «منتظر متن جست‌وجوی گوگل»
+_GOOGLE_MODE = "google"
 
 
 def _mouse_step(session: Dict[str, object]) -> int:
@@ -1206,12 +1403,84 @@ def _cycle_mouse_step(session: Dict[str, object], direction: str) -> int:
     return steps[idx]
 
 
+def _scroll_step(session: Dict[str, object]) -> int:
+    """گام اسکرول فعلی (تعداد کلیک چرخ در هر فشار)."""
+    try:
+        return int(session.get("scroll_step") or config.MOUSE_SCROLL_STEP_DEFAULT)
+    except (TypeError, ValueError):
+        return config.MOUSE_SCROLL_STEP_DEFAULT
+
+
+def _cycle_scroll_step(session: Dict[str, object], direction: str) -> int:
+    """جابه‌جایی گام اسکرول بین MOUSE_SCROLL_STEPS (پیچ از انتها به اول)."""
+    steps = list(config.MOUSE_SCROLL_STEPS)
+    cur = _scroll_step(session)
+    idx = (
+        steps.index(cur)
+        if cur in steps
+        else steps.index(config.MOUSE_SCROLL_STEP_DEFAULT)
+    )
+    idx = (idx + (1 if direction == "up" else -1)) % len(steps)
+    session["scroll_step"] = steps[idx]
+    return steps[idx]
+
+
+def _remember_target(session: Dict[str, object]) -> None:
+    """پنجره‌ی فعال فعلی را هدف کیبورد نگه می‌داریم (برای شورتکات‌ها)."""
+    h = windows.foreground()
+    if h and windows.is_window(h):
+        session["target_hwnd"] = h
+
+
+def _refocus_target(session: Dict[str, object]) -> None:
+    """
+    قبل از فرستادن کلید/ترکیب/متن، هدف را جلو می‌آورد.
+
+    اگر تلگرام دسکتاپ روی همین کامپیوتر باز باشد، زدنِ دکمه فوکوس را از
+    برنامه‌ی هدف می‌گیرد و شورتکات به جای مقصد به تلگرام می‌خورد؛ بدون این
+    مرحله Ctrl+C در تلگرام «کپی» می‌شود نه در برنامه‌ی هدف.
+    """
+    h = int(session.get("target_hwnd") or 0)
+    if not h or not windows.is_window(h):
+        return
+    if not windows.is_foreground(h):
+        windows.bring_to_front(h)
+
+
+def _switchable_windows(max_items: int = 10) -> list:
+    """لیست (hwnd, عنوان) پنجره‌های باز برای جابجایی (مثل تب‌های مرورگر)."""
+    items = []
+    for w in windows.list_windows():
+        title = str(w.get("title") or "").strip()
+        if not title:
+            continue
+        items.append((int(w["hwnd"]), title))
+        if len(items) >= max_items:
+            break
+    return items
+
+
+async def _close_window_picker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, object]
+) -> None:
+    """پیام انتخاب پنجره را حذف می‌کند (اگر حذف ممکن نشد بی‌صدا رد می‌شود)."""
+    msg_id = session.pop("win_pick_msg", None)
+    if msg_id is None:
+        return
+    try:
+        await context.bot.delete_message(update.effective_chat.id, msg_id)
+    except TelegramError:
+        pass
+
+
 def _mouse_caption(session: Dict[str, object]) -> str:
     """کپشن عکس حالت ماوس: مختصات لحظه‌ای + راهنمای یک‌خطی."""
     x, y = mouse.position()
     step = _mouse_step(session)
+    scroll_step = _scroll_step(session)
     return (
-        f"🖱 مختصات نشانگر: {x} , {y} | گام حرکت: {step} پیکسل\n"
+        f"🖱 مختصات نشانگر: {x} , {y} | گام حرکت: {step} پیکسل | "
+        f"اسکرول: {scroll_step}\n"
         "هر دکمه همان کار را روی دسکتاپ انجام می‌دهد و عکس تازه می‌شود.\n"
         "متن بنویس تا در همین نقطه تایپ شود (اول کلیک یا Shift+کلیک برای انتخاب).\n"
         "خروج: ❎ روی عکس، یا /cancel"
@@ -1243,13 +1512,19 @@ async def _mouse_refresh(
     ممکن نشد (پیام قدیمی، عکس حذف‌شده و...) عکس تازه فرستاده می‌شود.
     """
     jpeg, caption = await _mouse_snapshot(session)
-    kb = ui.mouse_keyboard(_mouse_step(session))
+    kb = ui.mouse_keyboard(_mouse_step(session), _scroll_step(session))
     query = update.callback_query
 
     if query is not None:
         try:
             await query.edit_message_media(
                 media=InputMediaPhoto(jpeg, caption=caption), reply_markup=kb
+            )
+            # شناسه‌ی همین پیام را نگه می‌داریم؛ وگرنه متنی که بعداً از مسیر
+            # پیامِ متنی می‌رسد (چسباندن در مکان سلکت‌شده) عکسِ همین پیام را
+            # به‌روز نمی‌کند و یک پیام تازه می‌سازد.
+            session["mouse_msg"] = getattr(
+                query.message, "message_id", session.get("mouse_msg")
             )
             return
         except TelegramError as exc:
@@ -1280,6 +1555,49 @@ async def _mouse_refresh(
         logger.warning("ارسال عکس حالت ماوس ناموفق بود", exc_info=True)
 
 
+async def _mouse_caption_edit(
+    query, caption: str, reply_markup=None
+) -> bool:
+    """
+    ویرایش کپشنِ پیامِ عکس حالت ماوس.
+
+    نکته‌ی مهم: این پیام یک «عکس» است نه متن؛ edit_message_text روی آن خطای
+    «no text in the message to edit» می‌دهد و بی‌صدا رد می‌شود (کپشن دست‌نخورده
+    می‌ماند). راه درست edit_message_caption است — دقیقاً به همین دلیل قبلاً
+    بعد از «خروج از حالت» هیچ دکمه‌ای دیده نمی‌شد.
+    """
+    try:
+        await query.edit_message_caption(caption=caption, reply_markup=reply_markup)
+        return True
+    except TelegramError as exc:
+        if "not modified" in str(exc).lower():
+            return False
+        logger.debug("ویرایش کپشن عکس حالت ماوس نشد: %s", exc)
+        return False
+
+
+async def _mouse_caption_by_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: Dict[str, object],
+    caption: str,
+    reply_markup=None,
+) -> None:
+    """همان ویرایش کپشن، ولی از مسیر پیام متنی (بدون callback)."""
+    msg_id = session.get("mouse_msg")
+    if msg_id is None:
+        return
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except TelegramError as exc:
+        logger.debug("به‌روزرسانی کپشن عکس حالت ماوس نشد: %s", exc)
+
+
 @security.owner_only
 async def cmd_mouse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1292,6 +1610,10 @@ async def cmd_mouse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = _session(context)
     session["mode"] = _MOUSE_MODE
     session.setdefault("mouse_step", config.MOUSE_STEP_DEFAULT)
+    session.setdefault("scroll_step", config.MOUSE_SCROLL_STEP_DEFAULT)
+    # پنجره‌ی فعالِ هنگام ورود را هدف کیبورد نگه می‌داریم تا شورتکات‌ها
+    # (حتی اگر تلگرام دسکتاپ فوکوس را بگیرد) به همان پنجره بخورد.
+    _remember_target(session)
     # پیام قبلی حالت را فراموش می‌کنیم تا عکس تازه، شناسه‌ی تازه بگیرد
     session.pop("mouse_msg", None)
 
@@ -1310,6 +1632,185 @@ async def on_button_mouse(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await cmd_mouse(update, context)
 
 
+# ------------------------------------------------------------------ گوگل
+def _open_url(url: str) -> None:
+    """باز کردن لینک در برنامه‌ی پیش‌فرض ویندوز (مرورگر)."""
+    os.startfile(url)
+
+
+def _focus_browser() -> bool:
+    """
+    پنجره‌ی مرورگری که لینک در آن باز شد جلو می‌آورد.
+
+    بدون این، عکس حالت ماوس ممکن است پنجره‌ی قبلی را نشان دهد و کلیک‌ها
+    به جای مرورگر، جای دیگر بخورد. اگر مرورگر پیدا نشد، بی‌صدا رد می‌شود —
+    جست‌وجو خودش باز شده است.
+    """
+    for kw in config.BROWSER_WINDOW_KEYWORDS:
+        hwnd = windows.find_window([kw])
+        if hwnd:
+            if windows.focus(hwnd):
+                return True
+    return False
+
+
+async def _google_search(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, query: str
+) -> None:
+    """
+    باز کردن جست‌وجوی گوگل در مرورگر و فعال کردن خودکار حالت کنترل ماوس.
+
+    ترتیب مهم است: اول لینک باز می‌شود، بعد صبر می‌کنیم تب مرورگر باز شود،
+    بعد پنجره‌اش جلو می‌آید، بعد صفحه‌ی نتایج می‌کشد، و در آخر حالت ماوس
+    فعال می‌شود تا کاربر بتواند روی نتایج اسکرول کند، وارد سایت‌ها شود و
+    بین صفحات جلو/عقب برود.
+    """
+    url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+    try:
+        await asyncio.to_thread(_open_url, url)
+    except Exception as exc:
+        logger.exception("باز کردن لینک گوگل ناموفق بود")
+        await _safe_reply(
+            update.effective_message, f"❌ باز کردن مرورگر انجام نشد: {exc}"
+        )
+        return
+
+    await _safe_reply(
+        update.effective_message, f"🔍 در حال باز کردن نتایج «{query}»…"
+    )
+
+    await asyncio.sleep(config.GOOGLE_OPEN_DELAY)
+    await asyncio.to_thread(_focus_browser)
+    await asyncio.sleep(config.GOOGLE_RENDER_DELAY)
+
+    # فعال‌سازی خودکار کنترل ماوس روی صفحه‌ی نتایج
+    await cmd_mouse(update, context)
+
+
+@security.owner_only
+async def cmd_google(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    جست‌وجوی گوگل.
+
+    با آرگومان (مثلاً `/google پایتون`) سریع جست‌وجو می‌کند؛ بدون آرگومان،
+    حالت انتظار فعال می‌شود و متن بعدی کاربر به‌عنوان عبارت جست‌وجو می‌رود.
+    """
+    text = " ".join(context.args or []).strip()
+    if text:
+        await _google_search(update, context, text)
+        return
+    session = _session(context)
+    session["mode"] = _GOOGLE_MODE
+    await _safe_reply(
+        update.effective_message,
+        "🔍 چه چیزی را در گوگل جست‌وجو کنم؟\n"
+        "متن را بفرست؛ بعد از باز شدن نتایج، حالت کنترل ماوس فعال می‌شود "
+        "تا بین صفحات حرکت کنی یا وارد سایت‌ها شوی.\n"
+        "برای انصراف /cancel را بزن.",
+    )
+
+
+@security.owner_only
+async def on_button_google(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_google(update, context)
+
+
+@security.owner_only
+async def cmd_remote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    کنسول ریموت وب: انتخاب تونل (Cloudflare یا ngrok) و ساخت لینک.
+
+    اگر از قبل فعال است، همان لینک قبلی نمایش داده می‌شود؛ در غیر این صورت
+    دو گزینه‌ی تونل نشان داده می‌شود تا کاربر یکی را انتخاب کند.
+    """
+    st = remote.status()
+    if st["running"] and st["url"]:
+        provider = str(st.get("provider") or "نامشخص")
+        label = {"cloudflare": "Cloudflare", "ngrok": "ngrok", "local": "محلی"}.get(
+            provider, provider
+        )
+        await _safe_reply(
+            update.effective_message,
+            "🔗 کنسول ریموت از قبل فعال است "
+            f"(تونل: {label}):\n"
+            f"{st['url']}\n\n"
+            "برای توقف: /remote_stop\n"
+            "⚠️ این لینک مثل رمز است؛ به کسی نده.",
+        )
+        return
+
+    await _safe_reply(
+        update.effective_message,
+        "🌐 کدام تونل برای کنسول ریموت راه‌اندازی شود؟\n\n"
+        "• Cloudflare: تونل سریع بدون نیاز به حساب (دانلود خودکار در اولین اجرا)\n"
+        "• ngrok: اگر نصب/تنظیم شده باشد (ممکن است نیاز به authtoken داشته باشد)\n\n"
+        "یکی را انتخاب کن:",
+        reply_markup=ui.remote_tunnel_keyboard(),
+    )
+
+
+async def _start_remote_tunnel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, provider: str
+) -> None:
+    """شروع تونل کنسول ریموت با سرویس انتخاب‌شده و ارسال لینک."""
+    query = update.callback_query
+    label = {"cloudflare": "Cloudflare", "ngrok": "ngrok"}.get(provider, provider)
+
+    st = remote.status()
+    if st["running"] and st["url"]:
+        cur = str(st.get("provider") or "")
+        cur_label = {"cloudflare": "Cloudflare", "ngrok": "ngrok", "local": "محلی"}.get(
+            cur, cur
+        )
+        if query is not None:
+            await _edit_query(
+                query,
+                "🔗 کنسول ریموت از قبل فعال است "
+                f"(تونل: {cur_label}):\n{st['url']}\n\n"
+                "برای توقف: /remote_stop\n⚠️ این لینک مثل رمز است؛ به کسی نده.",
+            )
+        return
+
+    if query is not None:
+        await _edit_query(
+            query,
+            f"⏳ در حال راه‌اندازی کنسول ریموت با تونل {label}...\n"
+            "این کار ممکن است تا یک دقیقه طول بکشد.",
+        )
+
+    target_msg = update.effective_message
+    try:
+        url = await asyncio.to_thread(remote.start, None, provider)
+    except remote.RemoteError as exc:
+        await _safe_reply(target_msg, f"❌ راه‌اندازی با {label} ناموفق بود:\n{exc}")
+        return
+    except Exception as exc:
+        logger.exception("راه‌اندازی کنسول ریموت (%s) ناموفق بود", provider)
+        await _safe_reply(target_msg, f"❌ راه‌اندازی کنسول ریموت ناموفق بود: {exc}")
+        return
+
+    await _safe_reply(
+        target_msg,
+        "🖥 کنسول ریموت آماده است "
+        f"(تونل: {label}):\n{url}\n\n"
+        "• صفحه زنده با نشانگر ماوس دیده می‌شود\n"
+        "• کلیک/درگ/اسکرول و تایپ (فارسی هم) از مرورگر کار می‌کند\n"
+        "• توقف: /remote_stop\n"
+        "⚠️ این لینک مثل رمز است؛ به کسی نده. بعد از راه‌اندازی تازه، "
+        "لینک قبلی می‌میرد.",
+    )
+
+
+@security.owner_only
+async def cmd_remote_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """توقف کنسول ریموت و بستن تونل کلودفلر."""
+    was = await asyncio.to_thread(remote.stop)
+    if was:
+        await _safe_reply(update.effective_message, "✅ کنسول ریموت و تونل بسته شد.")
+    else:
+        await _safe_reply(update.effective_message, "کنسول ریموت از قبل بسته بود.")
+
+
 async def _mouse_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
 ) -> None:
@@ -1326,16 +1827,44 @@ async def _mouse_callback(
     action = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
 
+    # این سه تا قبل از چک حالت‌اند، چون بعد از «خروج» (یعنی خارج از حالت
+    # ماوس) هم باید کار کنند؛ دکمه‌های حرکتی برعکس بعد از خروج بی‌اثرند.
     if action == "exit":
         session["mode"] = ""
-        session.pop("mouse_msg", None)
-        await _edit_query(
-            query, "❎ از حالت کنترل ماوس خارج شدی؛ منوی اصلی سر جایش است."
+        # موقعیت نشانگر را نگه می‌داریم تا در صفحه‌ی بعدی به کاربر نشان
+        # داده شود (خودِ چسباندن با فوکوس پنجره انجام می‌شود، نه مختصات).
+        x, y = mouse.position()
+        await _mouse_caption_edit(
+            query,
+            "❎ از حالت کنترل ماوس خارج شدی.\n"
+            f"نشانگر روی {x} , {y} بود.\n"
+            "اگر جایی را انتخاب کردی، با دکمه‌ی زیر متن‌ات را در همان‌جا "
+            "می‌گذارم:",
+            reply_markup=ui.mouse_exit_keyboard(),
         )
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except TelegramError:
-            logger.debug("حذف کیبورد شناور حالت ماوس ممکن نشد.", exc_info=True)
+        return
+
+    if action == "type_ask":
+        session["mode"] = _MOUSE_TYPE_MODE
+        x, y = mouse.position()
+        await _mouse_caption_edit(
+            query,
+            f"✍️ متن را بفرست تا در مکان سلکت‌شده (نشانگر {x} , {y}) "
+            "چسبانده شود.\nبرای انصراف «✖️ کنسل» یا /cancel.",
+            reply_markup=ui.mouse_type_keyboard(),
+        )
+        return
+
+    if action == "type_cancel":
+        session["mode"] = ""
+        await _mouse_caption_edit(
+            query, "❎ انصراف؛ چیزی چسبانده نشد.", reply_markup=None
+        )
+        if query.message is not None:
+            await query.message.reply_text(
+                "👌 انصراف. منوی پایین چت سر جایش است.",
+                reply_markup=ui.main_menu(),
+            )
         return
 
     if session.get("mode") != _MOUSE_MODE:
@@ -1343,6 +1872,43 @@ async def _mouse_callback(
         await query.answer(
             "حالت ماوس بسته است؛ برای ادامه /mouse را بزن.", show_alert=True
         )
+        return
+
+    # ---- جابجایی بین پنجره‌های باز (مثل تب‌ها در مرورگر)
+    if action == "winlist":
+        items = await asyncio.to_thread(_switchable_windows)
+        if not items:
+            await query.answer("پنجره‌ای باز نیست.", show_alert=True)
+            return
+        session["win_list"] = items
+        msg = await query.message.reply_text(
+            "🗂 کدام پنجره را جلو بیاورم؟ (مثل تعویض تب)",
+            reply_markup=ui.windows_keyboard(items),
+        )
+        session["win_pick_msg"] = getattr(msg, "message_id", None)
+        return
+
+    if action == "win":
+        items = session.get("win_list") or []
+        try:
+            idx = int(arg)
+        except ValueError:
+            idx = -1
+        if not (0 <= idx < len(items)):
+            await query.answer("این پنجره دیگر در لیست نیست.", show_alert=True)
+            return
+        hwnd = items[idx][0]
+        ok = await asyncio.to_thread(windows.bring_to_front, hwnd)
+        await _close_window_picker(update, context, session)
+        if ok:
+            session["target_hwnd"] = hwnd
+        await query.answer("جلو آمد ✅" if ok else "نیامد ❌", show_alert=not ok)
+        await _mouse_refresh(update, context, session)
+        return
+
+    if action == "winback":
+        await _close_window_picker(update, context, session)
+        await query.answer()
         return
 
     step = _mouse_step(session)
@@ -1356,25 +1922,34 @@ async def _mouse_callback(
             if arg not in ("up", "down"):
                 return False
             _cycle_mouse_step(session, arg)
+        elif action == "sstep":
+            if arg not in ("up", "down"):
+                return False
+            _cycle_scroll_step(session, arg)
         elif action == "click":
             if arg not in mouse.CLICKS:
                 return False
             mouse.click(arg)
+            _remember_target(session)
         elif action == "down":
             mouse.hold()
+            _remember_target(session)
         elif action == "up":
             mouse.release()
+            _remember_target(session)
         elif action == "scroll":
             if arg not in ("up", "down"):
                 return False
-            mouse.scroll(arg)
+            mouse.scroll(arg, _scroll_step(session))
         elif action == "key":
             if arg not in mouse.KEYS:
                 return False
+            _refocus_target(session)
             mouse.press(arg)
         elif action == "combo":
             if arg not in mouse.COMBOS:
                 return False
+            _refocus_target(session)
             mouse.combo(arg)
         elif action == "shot":
             pass  # فقط عکس تازه می‌خواهد
@@ -1413,8 +1988,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _run_opencode(update, context, text)
         return
 
-    if mode == _MOUSE_MODE:
-        # در حالت ماوس، هر متنی به‌جای رفتن به AI، در همان نقطه‌ای که
+    if mode in (_MOUSE_MODE, _MOUSE_TYPE_MODE):
+        # در این حالت‌ها، هر متنی به‌جای رفتن به AI، در همان نقطه‌ای که
         # نشانگر است چسبانده می‌شود (خواسته‌ی اصلی: تایپ روی جایی که با
         # ماوس انتخاب کردی). استثنا: دکمه‌ی منو که حالت را می‌بندد و
         # از همینجا به dispatch پایین می‌رود.
@@ -1422,6 +1997,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             session["mode"] = ""
         else:
             try:
+                # اول هدف را جلو می‌آوریم؛ وگرنه اگر تلگرام دسکتاپ فوکوس
+                # گرفته باشد، چسباندن در پنجره‌ی تلگرام انجام می‌شود نه مقصد
+                _refocus_target(session)
                 await asyncio.to_thread(mouse.set_text, text)
             except Exception as exc:
                 logger.exception("چسباندن متن در حالت ماوس ناموفق بود")
@@ -1430,15 +2008,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             preview = text if len(text) <= 40 else text[:40] + "…"
-            await _safe_reply(update.effective_message, f"⌨️ چسبانده شد: {preview}")
-            # عکس تازه تا خودِ متن تایپ‌شده هم در چت دیده شود
-            await _mouse_refresh(update, context, session)
+            await _safe_reply(
+                update.effective_message,
+                f"⌨️ چسبانده شد: {preview}",
+                reply_markup=ui.main_menu(),
+            )
+            if mode == _MOUSE_TYPE_MODE:
+                # جریان «تایپ بعد از خروج» تمام شد؛ عکس هم پیام «تمام» می‌گیرد
+                session["mode"] = ""
+                await _mouse_caption_by_id(
+                    update, context, session,
+                    "✅ متن در مکان سلکت‌شده چسبانده شد.",
+                )
+            else:
+                await _mouse_refresh(update, context, session)
             return
+
+    # اگر در جست‌وجوی مدل هستیم و کاربر دکمه‌ی منو زد، حالت جست‌وجو بسته شود
+    if mode == "model_search" and ui.match_button(text):
+        session["mode"] = ""
+        mode = ""
 
     button = ui.match_button(text)
     if button:
         if button == ui.BTN_SCREENSHOT:
             await on_button_screenshot(update, context)
+        elif button == ui.BTN_CAMERA:
+            await on_button_camera(update, context)
         elif button == ui.BTN_APPS:
             await on_button_apps(update, context)
         elif button == ui.BTN_PROMPT:
@@ -1449,6 +2045,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await on_button_tabs(update, context)
         elif button == ui.BTN_MOUSE:
             await on_button_mouse(update, context)
+        elif button == ui.BTN_GOOGLE:
+            await on_button_google(update, context)
+        return
+
+    if mode == _GOOGLE_MODE:
+        session["mode"] = ""
+        await _google_search(update, context, text)
         return
 
     if mode == "search":
@@ -1459,6 +2062,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if mode == "prompt":
         session["mode"] = ""
         await _generate_prompt(update, context, text)
+        return
+
+    if mode == "model_search":
+        session["model_query"] = text
+        session["model_page"] = 0
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        await _show_models(
+            update, context, pname, page=0, edit=False,
+            notice=f'نتایج جست‌وجو برای «{text}»',
+        )
         return
 
     # دکمه‌ی ناشناخته (مثلاً کیبوردِ نسخه‌ی قدیمی): نباید به AI فرستاده شود
@@ -1484,6 +2097,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
 
     if data == "noop":
+        return
+
+    # ---- دوربین
+    if data == "camera_detect":
+        await _camera_detect_and_show(update, context)
+        return
+
+    if data.startswith("camera_set:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            idx = 0
+        imaging.set_camera_index(idx)
+        await _edit_query(query, f"✅ دوربین {idx} ذخیره شد. /camera همیشه از همین عکس می‌گیرد.")
+        return
+
+    if data == "camera_back":
+        await _edit_query(query, "⚙️ تنظیمات دوربین بسته شد.")
         return
 
     # ---- برنامه‌ها
@@ -1636,6 +2267,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _mouse_callback(update, context, data)
         return
 
+    # ---- کنسول ریموت (انتخاب تونل)
+    if data.startswith("remote_start:"):
+        provider = data.split(":", 1)[1].strip().lower()
+        if provider not in ("cloudflare", "ngrok"):
+            await query.answer("تونل نامعتبر است.", show_alert=True)
+            return
+        await _start_remote_tunnel(update, context, provider)
+        return
+
     # ---- سرویس AI و کلید
     if data.startswith("provider:"):
         name = data.split(":", 1)[1]
@@ -1646,7 +2286,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         has_key = bool(ai.api_key(provider))
         lines = [
             f"✅ سرویس فعال: **{provider['name']}**",
-            f"مدل: `{provider['model']}`",
+            f"مدل: `{ai.effective_model(provider)}`",
             f"آدرس: `{provider['base_url']}`",
             "",
         ]
@@ -1708,10 +2348,121 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         name = data.split(":", 1)[1]
         if secrets.clear_key(name):
             await _edit_query(query, 
-                f"🗑 کلید «{name}» پاک شد."
+                f"🗑 کلید «{name}» پاک شد.",
+                reply_markup=ui.provider_key_actions(name, secrets.has_key(name)),
             )
         else:
             await query.answer("کلیدی برای این سرویس نبود.", show_alert=True)
+        return
+
+    # ---- مدل‌های سرویس AI
+    if data.startswith("models_open:"):
+        pname = data.split(":", 1)[1]
+        if _provider_by_name(pname) is None:
+            await query.answer("سرویس پیدا نشد.", show_alert=True)
+            return
+        session = _session(context)
+        session["model_provider"] = pname
+        session["model_query"] = ""
+        session["model_page"] = 0
+        await _edit_query(query, f"⏳ در حال دریافت مدل‌های «{pname}»…")
+        await _show_models(update, context, pname, page=0, edit=True)
+        return
+
+    if data.startswith("models_page:"):
+        try:
+            page = int(data.split(":", 1)[1] or 0)
+        except ValueError:
+            page = 0
+        session = _session(context)
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        await _show_models(update, context, pname, page=page, edit=True)
+        return
+
+    if data == "models_refresh":
+        session = _session(context)
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        await _edit_query(query, f"⏳ در حال تازه‌سازی لیست مدل‌های «{pname}»…")
+        await _show_models(update, context, pname, page=0, edit=True, force=True)
+        return
+
+    if data == "models_search_ask":
+        session = _session(context)
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        session["mode"] = "model_search"
+        session["model_provider"] = pname
+        await _edit_query(
+            query,
+            f"🔍 عبارت جست‌وجو برای مدل‌های «{pname}» را بفرست.\n"
+            "مثال: `free` برای دیدن مدل‌های رایگان.\n"
+            "برای انصراف /cancel را بزن.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "models_search_clear":
+        session = _session(context)
+        session["model_query"] = ""
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        await _show_models(update, context, pname, page=0, edit=True)
+        return
+
+    if data.startswith("model_pick:"):
+        token = data.split(":", 1)[1]
+        model_id = ui.resolve_model_id(token)
+        session = _session(context)
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        provider = _provider_by_name(pname)
+        if provider is None or not model_id:
+            await query.answer("مدل یا سرویس نامعتبر است.", show_alert=True)
+            return
+        ai.set_selected_model(pname, model_id)
+        ai.set_provider(pname)
+        await _edit_query(
+            query,
+            f"✅ مدل انتخاب شد.\n\n"
+            f"سرویس: **{provider['name']}**\n"
+            f"مدل: `{ai.effective_model(provider)}`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 بازگشت به لیست مدل‌ها", callback_data=f"models_open:{pname}")],
+                [InlineKeyboardButton("🔙 تنظیمات سرویس", callback_data=f"provider:{pname}")],
+            ]),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "models_back":
+        session = _session(context)
+        pname = str(session.get("model_provider") or ai.active_provider()["name"])
+        provider = _provider_by_name(pname)
+        if provider is None:
+            await query.answer("سرویس پیدا نشد.", show_alert=True)
+            return
+        ai.set_provider(pname)
+        has_key = bool(ai.api_key(provider))
+        lines = [
+            f"✅ سرویس فعال: **{provider['name']}**",
+            f"مدل: `{ai.effective_model(provider)}`",
+            f"آدرس: `{provider['base_url']}`",
+            "",
+        ]
+        if has_key:
+            src = ai.key_source(provider)
+            where = (
+                "متغیر محیطی" if src == "env" else f"data\\secrets.json ({secrets.masked(ai.api_key(provider))})"
+            )
+            lines.append(f"🔑 کلید ثبت شده — منبع: {where}")
+        else:
+            lines.append(
+                "🔑 کلیدی ثبت نشده. با دکمه‌ی زیر کلید را بفرستید؛ "
+                "پیام شما بعد از ذخیره پاک می‌شود."
+            )
+        await _edit_query(
+            query,
+            "\n".join(lines),
+            reply_markup=ui.provider_key_actions(provider["name"], has_key),
+            parse_mode="Markdown",
+        )
         return
 
     # ---- خاموشی
@@ -1743,6 +2494,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ------------------------------------------------------------------ راه‌اندازی
 async def _post_init(app: Application) -> None:
     logger.info("بات در حال اجرا — مالک‌ها: %s", _owner_ids())
+
+    # خطاهای taskهای asyncio که به هیچ هندلری نمی‌رسند (مثلاً crash در
+    # task پس‌زمینه) به‌صورت پیش‌فرض فقط در کنسول گم می‌شوند و گاهی
+    # کل event loop را می‌کشند. این handler همه را در لاگ می‌نویسد.
+    def _loop_exception_handler(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        if exc is not None:
+            logger.critical("خطای رسیده‌نگه‌داشته‌شده در asyncio: %s", msg, exc_info=exc)
+        else:
+            logger.critical(" رویداد asyncio بدون استثنا: %s | کلیدها: %s",
+                            msg, list(context.keys()))
+
+    asyncio.get_event_loop().set_exception_handler(_loop_exception_handler)
+
     # پیش‌گرم کردن کش برنامه‌ها تا اولین استفاده سریع باشد
     asyncio.create_task(_warm_cache(app))
 
@@ -1796,11 +2562,31 @@ def _build_request() -> "HTTPXRequest":
     )
 
 
+def _build_poll_request() -> "HTTPXRequest":
+    """
+    request جداگانه‌ی getUpdates (polling).
+
+    کتابخانه‌ی PTB برای polling از یک HTTPXRequest دوم استفاده می‌کند که
+    فقط با get_updates_request روی builder تنظیم می‌شود. بدون آن، درخواست
+    long-poll ده‌ثانیه‌ای با timeout پیش‌فرض httpx (۵ ثانیه) ارسال می‌شد و
+    همیشه «Timed out» می‌گرفت؛ بات بالا می‌آمد ولی هیچ پیامی نمی‌گرفت.
+    read_timeout باید بزرگ‌تر از timeout خود long-poll باشد.
+    """
+    return HTTPXRequest(
+        connection_pool_size=1,
+        connect_timeout=config.TELEGRAM_CONNECT_TIMEOUT,
+        read_timeout=config.TELEGRAM_POLL_READ_TIMEOUT,
+        write_timeout=config.TELEGRAM_WRITE_TIMEOUT,
+        pool_timeout=config.TELEGRAM_POOL_TIMEOUT,
+    )
+
+
 def build_app() -> Application:
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
         .request(_build_request())
+        .get_updates_request(_build_poll_request())
         .post_init(_post_init)
         .concurrent_updates(True)
         .build()
@@ -1811,6 +2597,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
 
     app.add_handler(CommandHandler(["shot", "screenshot"], cmd_shot))
+    app.add_handler(CommandHandler("camera", cmd_camera))
+    app.add_handler(CommandHandler("camera_setup", cmd_camera_setup))
 
     app.add_handler(CommandHandler("apps", cmd_apps))
     app.add_handler(CommandHandler("open", cmd_open))
@@ -1820,6 +2608,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("provider", cmd_provider))
     app.add_handler(CommandHandler(["tabopencode", "tabs", "tab"], cmd_tabs))
     app.add_handler(CommandHandler("mouse", cmd_mouse))
+    app.add_handler(CommandHandler("google", cmd_google))
+    app.add_handler(CommandHandler("remote", cmd_remote))
+    app.add_handler(CommandHandler("remote_stop", cmd_remote_stop))
     app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("reject", cmd_reject))
@@ -1886,6 +2677,32 @@ def main() -> int:
       3  توکن نامعتبر
       4  خطای شبکه هنگام اتصال به تلگرام
     """
+    # crash های لایه‌ی C (درون pywin32/PIL/ctypes) هیچ traceback پایتونی
+    # ندارند و پروسه را با کد -1 می‌کشند. faulthandler آدرس‌ها را در
+    # logs\crash.log می‌نویسد تا محل خرابی قابل پیگیری باشد.
+    try:
+        import faulthandler
+
+        crash_path = os.path.join(os.path.dirname(config.LOG_FILE), "crash.log")
+        os.makedirs(os.path.dirname(crash_path), exist_ok=True)
+        _crash_fh = open(crash_path, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:
+        pass
+
+    # هر استثنایی که از run_polling بیرون بزند (حتی BaseExceptionهای عجیب)
+    # باید در لاگ دیده شود؛ وگرنه فقط کد خروج -1 می‌ماند.
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.critical(
+            "استثنای رسیده‌نگه‌داشته‌شده در سطح بالا",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    sys.excepthook = _excepthook
+
     if config.BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
         return print_setup_help()
     if not config.OWNER_IDS or all(x == 111111111 for x in config.OWNER_IDS):
@@ -1935,6 +2752,11 @@ def main() -> int:
             "────────────────────────────────────────────────────────────"
         )
         return 4
+    except BaseException:
+        # هر استثنای دیگری (حتی SystemExit عجیب) باید در لاگ دیده شود؛
+        # وگرنه فقط «exit code -1» می‌ماند و هیچ سرنخی نیست.
+        logger.critical("خطای غیرمنتظره در run_polling", exc_info=True)
+        raise
     finally:
         singleton.release()
     return 0

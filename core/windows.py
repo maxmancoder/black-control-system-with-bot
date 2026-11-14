@@ -155,6 +155,64 @@ def is_foreground(hwnd: int) -> bool:
         return False
 
 
+def foreground() -> int:
+    """handle پنجره‌ی فعال فعلی (0 اگر پیدا نشد)."""
+    if not _HAS_WIN32:
+        return 0
+    try:
+        return int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def bring_to_front(hwnd: int) -> bool:
+    """
+    پنجره را فقط جلو می‌آورد؛ بدون maximize.
+
+    برای « refocus قبل از فرستادن کلید/ترکیب » لازم است: اگر تلگرام
+    دسکتاپ روی همین کامپیوتر فوکوس گرفته باشد، Ctrl+C به جای مقصد
+    به تلگرام می‌خورد. focus() اینجا قابل استفاده نیست چون پنجره را
+    maximize می‌کند و اندازه‌ی پنجره‌ی هدف را به هم می‌زند.
+
+    ویندوز از پروسه‌ی پس‌زمینه (مثل بات) اجازه‌ی SetForegroundWindow
+    نمی‌دهد مگر اینکه «قفل فوکوس» باز شود؛ تریک کلید ALT این قفل را
+    می‌شکند. بدون آن، خطا می‌دهد و پنجره جلو نمی‌آید.
+    """
+    if not _HAS_WIN32 or not hwnd:
+        return False
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+        if is_foreground(hwnd):
+            return True
+        # اگر پنجره minimize است، اول restore کن؛ SetForegroundWindow
+        # روی پنجره‌ی minimize جواب نمی‌دهد
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.1)
+        # تریک ALT: فشار و رها کردن کلید ALT قفل فوکوس ویندوز را باز می‌کند
+        # و به پروسه‌ی پس‌زمینه اجازه می‌دهد SetForegroundWindow بزند
+        _unlock_foreground()
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            _force_foreground(hwnd)
+        time.sleep(0.15)
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        # تلاش دوم با تریک SwitchToThisWindow (تحمل بیشتری نسبت به
+        # SetForegroundWindow در برابر قفل فوکوس دارد)
+        try:
+            ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+            time.sleep(0.15)
+        except Exception:
+            pass
+        return win32gui.GetForegroundWindow() == hwnd
+    except Exception:
+        logger.exception("bring_to_front ناموفق بود")
+        return False
+
+
 def is_window(hwnd: int) -> bool:
     if not _HAS_WIN32 or not hwnd:
         return False
@@ -188,6 +246,10 @@ def focus(hwnd: int) -> bool:
         if not win32gui.IsWindow(hwnd):
             return False
         maximize(hwnd)
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.1)
+        _unlock_foreground()
         try:
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
@@ -195,6 +257,13 @@ def focus(hwnd: int) -> bool:
             # شبیه‌سازی کلیک روی نوار وظیفه راه‌حل رایج است.
             _force_foreground(hwnd)
         time.sleep(0.2)
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        try:
+            ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+            time.sleep(0.15)
+        except Exception:
+            pass
         return win32gui.GetForegroundWindow() == hwnd
     except Exception:
         logger.exception("focus ناموفق بود")
@@ -218,6 +287,25 @@ def _force_foreground(hwnd: int) -> None:
     finally:
         user32.AttachThreadInput(cur_thread, fg_thread, False)
         user32.AttachThreadInput(cur_thread, target_thread, False)
+
+
+def _unlock_foreground() -> None:
+    """
+    قفل فوکوس ویندوز را برای پروسه‌ی پس‌زمینه باز می‌کند.
+
+    ویندوز فقط به پروسه‌ای که «در حال تعامل» است اجازه می‌دهد
+    فوکوس را بدزدد. فشار و رها کردن کلید ALT (بدون هیچ برنامه‌ی
+    دیگری) باعث می‌شود ویندوز فکر کند کاربر کلید زده و قفل باز شود.
+    این تریک رایج‌ترین راه‌حل مشکل SetForegroundWindow از پس‌زمینه است.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        # keybd_event(key, scan, flags, extra) — flags=0 یعنی key down
+        # و 2 یعنی key up. کد 0x12 کلید ALT است.
+        user32.keybd_event(0x12, 0, 0, 0)     # ALT فشرده
+        user32.keybd_event(0x12, 0, 2, 0)     # ALT رها شده
+    except Exception:
+        pass
 
 
 def window_rect(hwnd: int):

@@ -182,31 +182,50 @@ def _input_click_points(hwnd: int) -> List[Tuple[int, int]]:
     """
     نقاطی که برای فوکوس روی کادر ورودی امتحان می‌شوند.
 
-    ترتیب عمدی است: اول مرکز کادر تنظیم‌شده چون قابل اتکاست، بعد نقطه‌ی
-    UI Automation ولی فقط اگر داخل همان کادر باشد، و در آخر چند نقطه‌ی
-    جایگزین. هیچ نقطه‌ای بیرون از کادر برگردانده نمی‌شود.
+    ترتیب عمدی است: اول مرکز کادر تنظیم‌شده، بعد نقاط جایگزین داخل همان
+    کادر، و در آخر (در صورت نیاز) عنصر UI Automation داخل پنجره حتی اگر بیرون
+    از کادر پیکربندی‌شده باشد. این حالت آخر برای زمانی است که رابط OpenCode
+    عوض شده و نسبت‌های config دیگر دقیق نیستند.
     """
     points: List[Tuple[int, int]] = []
     box = _input_box_rect(hwnd)
     if box is None:
         return points
 
-    def add(point) -> None:
-        if point and _inside_box(point, box) and point not in points:
-            points.append(point)
-
     rect = windows.window_rect(hwnd)
+    if rect is None:
+        return points
     left, top, right, bottom = rect
     w = right - left
     h = bottom - top
-
     x0, y0, x1, y1 = box
+
+    def add(point, *, require_in_box: bool = True) -> None:
+        if not point or point in points:
+            return
+        if require_in_box:
+            if _inside_box(point, box):
+                points.append(point)
+            return
+        px, py = point
+        if left <= px <= right and top <= py <= bottom:
+            points.append(point)
+
+    # مرکز کادر پیکربندی‌شده
     add(((x0 + x1) // 2, (y0 + y1) // 2))
 
-    add(_uia_input_point(hwnd))
+    uia_pt = _uia_input_point(hwnd)
+    # نقطه‌ی UI Automation اگر داخل کادر پیکربندی‌شده باشد، زود امتحان می‌شود
+    if uia_pt and _inside_box(uia_pt, box):
+        add(uia_pt)
 
     for fx, fy in config.OPENCODE_INPUT_FALLBACKS:
         add((left + int(w * fx), top + int(h * fy)))
+
+    # اگر UIA عنصری داخل پنجره پیدا کرد ولی بیرون از کادر پیکربندی‌شده بود،
+    # به‌عنوان تلاش آخر اضافه می‌شود (رابط ممکن است جابه‌جا شده باشد).
+    if uia_pt and not _inside_box(uia_pt, box):
+        add(uia_pt, require_in_box=False)
 
     return points
 
@@ -236,7 +255,10 @@ def _paste_prompt(hwnd: int, prompt: str) -> str:
 
     points = _input_click_points(hwnd)
     if not points:
-        raise PromptFailure("مختصات کادر ورودی OpenCode پیدا نشد.")
+        raise PromptFailure(
+            "جای کادر نوشتن متن در OpenCode پیدا نشد. "
+            "مطمئن شو پنجره‌ی OpenCode باز و در دسترس است."
+        )
 
     region = _input_region(hwnd)
 
@@ -402,12 +424,13 @@ async def send_prompt(
             await notify("چسباندن متن انجام نشد. وضعیت فعلی را می‌فرستم:")
             await shot(
                 "⚠️ نتوانستم متن را داخل کادر OpenCode بگذارم. "
-                "شاید کادر در جای دیگری است."
+                "شاید کادر در جای دیگری است یا تب/چت درست انتخاب نشده است."
             )
             raise PromptFailure(
-                "چسباندن متن در کادر OpenCode انجام نشد.\n"
+                "نوشتن متن در کادر OpenCode انجام نشد (جای نوشتن پیدا نشد یا چسباندن تأیید نشد).\n"
+                "مطمئن شو تب درست OpenCode باز است و کادر پیام در دسترس است.\n"
                 "اگر رابط OpenCode عوض شده، نسبت‌های OPENCODE_INPUT_REGION و "
-                "OPENCODE_INPUT_FALLBACKS را در config.py اصلاح کنید."
+                "OPENCODE_INPUT_FALLBACKS را در config.py اصلاح کن."
             )
         logger.info("پرامپت با روش %s چسبانده شد.", paste_method)
         await asyncio.sleep(0.5)
@@ -428,12 +451,13 @@ async def send_prompt(
                 sent = True
                 break
             check_screen = await imaging.grab_screen_async()
-            if await asyncio.to_thread(
+            found_stop, _ = await asyncio.to_thread(
                 imaging.find_template,
                 check_screen,
                 config.OPENCODE_TEMPLATE_STOP,
                 threshold=0.8,
-            )[0]:
+            )
+            if found_stop:
                 sent = True
                 break
             # اگر دکمه‌ی توقف ظاهر نشده ولی کادر هم خالی نشده، ممکن است
@@ -514,12 +538,12 @@ async def _wait_for_completion(
         # روش ۱ (قوی‌ترین): دکمه‌ی توقف به حالت ارسال برگشته یعنی کار تمام است.
         # فقط وقتی قالب موجود است.
         if has_stop_template:
-            stop_visible = await asyncio.to_thread(
+            stop_visible, _ = await asyncio.to_thread(
                 imaging.find_template,
                 screen,
                 config.OPENCODE_TEMPLATE_STOP,
                 threshold=0.8,
-            )[0]
+            )
             if not stop_visible:
                 await notify("✅ کار تمام شد.")
                 return "completed"

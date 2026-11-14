@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -21,6 +22,8 @@ from core import secrets
 logger = logging.getLogger(__name__)
 
 _settings_cache: Optional[Dict[str, str]] = None
+_models_cache: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
+_MODELS_TTL = 600  # ثانیه کش لیست مدل‌ها
 
 
 def _load_settings() -> Dict[str, str]:
@@ -77,6 +80,35 @@ def set_provider(name: str) -> bool:
     return False
 
 
+def selected_model(provider_name: str) -> str:
+    """مدل انتخاب‌شده‌ی کاربر برای یک سرویس (اگر ذخیره شده باشد)."""
+    if not provider_name:
+        return ""
+    data = _load_settings()
+    models = data.get("selected_models") or {}
+    if not isinstance(models, dict):
+        return ""
+    key = provider_name.strip().lower()
+    return str(models.get(key) or models.get(provider_name) or "").strip()
+
+
+def set_selected_model(provider_name: str, model_id: str) -> bool:
+    """ذخیره‌ی مدل انتخابی برای یک سرویس."""
+    if not provider_name or not model_id:
+        return False
+    data = dict(_load_settings())
+    models = dict(data.get("selected_models") or {})
+    models[provider_name.strip().lower()] = str(model_id).strip()
+    data["selected_models"] = models
+    _save_settings(data)
+    return True
+
+
+def effective_model(provider: Dict[str, str]) -> str:
+    """مدلی که واقعاً استفاده می‌شود: انتخاب کاربر یا پیش‌فرض سرویس."""
+    return selected_model(provider.get("name", "")) or str(provider.get("model", "")).strip()
+
+
 def api_key(provider: Dict[str, str]) -> str:
     """
     کلید یک سرویس.
@@ -114,6 +146,9 @@ def provider_status() -> List[Tuple[str, str, str]]:
             note = "بدون کلید (سرویس محلی)"
         else:
             note = "کلید ثبت نشده"
+        model = effective_model(p)
+        if model:
+            note += f"\n    مدل: {model}"
         out.append((p["name"], src, note))
     return out
 
@@ -129,7 +164,7 @@ async def _call_provider(provider: Dict[str, str], raw: str) -> str:
             headers["Authorization"] = f"Bearer {key}"
 
     payload = {
-        "model": provider["model"],
+        "model": effective_model(provider),
         "messages": [
             {"role": "system", "content": config.PROMPT_SYSTEM},
             {"role": "user", "content": config.PROMPT_USER_TEMPLATE.format(raw=raw)},
@@ -230,3 +265,130 @@ def load_prompt() -> str:
 def reset_cache() -> None:
     global _settings_cache
     _settings_cache = None
+
+
+def _normalize_model(item) -> Optional[Dict[str, str]]:
+    """یک مدل را به شکل یکسان برای نمایش/جست‌وجو/انتخاب تبدیل می‌کند."""
+    if isinstance(item, str):
+        item = {"id": item}
+    if not isinstance(item, dict):
+        return None
+    mid = str(item.get("id") or item.get("name") or "").strip()
+    if not mid:
+        return None
+    name = str(item.get("name") or mid).strip() or mid
+    label = name
+    # اگر نام خوانا با شناسه متفاوت بود، شناسه را هم نشان بده
+    if name != mid and mid.lower() not in name.lower() and len(f"{name} ({mid})") <= 80:
+        label = f"{name} ({mid})"
+
+    # تشخیص مدل رایگان (برای فیلتر "free"/"رایگان")
+    is_free = False
+    pricing = item.get("pricing")
+    if isinstance(pricing, dict):
+        try:
+            p_prompt = float(pricing.get("prompt") or 0)
+            p_comp = float(pricing.get("completion") or 0)
+            if p_prompt == 0 and p_comp == 0:
+                is_free = True
+        except Exception:
+            pass
+    if ":free" in mid.lower():
+        is_free = True
+
+    search = f"{mid} {name}".lower()
+    if is_free:
+        if "free" not in search:
+            search += " free"
+        search += " رایگان"
+
+    return {
+        "id": mid,
+        "label": label,
+        "search": search,
+        "free": "1" if is_free else "0",
+    }
+
+
+async def fetch_models(
+    provider: Dict[str, str], force: bool = False
+) -> Tuple[bool, List[Dict[str, str]], str]:
+    """
+    لیست مدل‌های یک سرویس را از API می‌گیرد.
+
+    خروجی: (موفق؟, لیست مدل‌ها, پیام خطا)
+    هر مدل شامل id/label/search/free است.
+    """
+    pname = str(provider.get("name") or "").strip()
+    if not pname:
+        return False, [], "سرویس نامعتبر است."
+    now = time.time()
+    cache_key = pname.lower()
+    if not force:
+        cached = _models_cache.get(cache_key)
+        if cached and now - cached[0] < _MODELS_TTL:
+            return True, list(cached[1]), ""
+
+    base = str(provider.get("base_url") or "").rstrip("/")
+    if not base:
+        return False, [], "آدرس سرویس تنظیم نشده است."
+    # رابط سازگار OpenAI: /models
+    url = base + "/models"
+
+    headers = {"Accept": "application/json"}
+    if provider.get("auth", "bearer") == "bearer":
+        key = api_key(provider)
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+    timeout = httpx.Timeout(float(provider.get("timeout", 60)))
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code >= 400:
+                body = (resp.text or "").strip()[:220]
+                return False, [], f"HTTP {resp.status_code}: {body}"
+            data = resp.json()
+    except Exception as exc:
+        return False, [], f"دریافت لیست مدل‌ها ناموفق بود: {exc}"
+
+    if isinstance(data, dict):
+        raw_list = data.get("data") or data.get("models") or []
+    elif isinstance(data, list):
+        raw_list = data
+    else:
+        raw_list = []
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in raw_list or []:
+        norm = _normalize_model(item)
+        if not norm:
+            continue
+        if norm["id"] in seen:
+            continue
+        seen.add(norm["id"])
+        out.append(norm)
+
+    if not out:
+        return False, [], "مدلی از این سرویس دریافت نشد."
+
+    _models_cache[cache_key] = (now, list(out))
+    return True, out, ""
+
+
+def filter_models(models: List[Dict[str, str]], query: str) -> List[Dict[str, str]]:
+    """فیلتر مدل‌ها بر اساس عبارت جست‌وجو (مثلاً free)."""
+    q = (query or "").strip().lower()
+    if not q:
+        return list(models)
+    # همه‌ی کلمات جست‌وجو باید پیدا شوند
+    terms = [t for t in q.split() if t]
+    if not terms:
+        return list(models)
+    res = []
+    for m in models:
+        hay = str(m.get("search") or f"{m.get('id','')} {m.get('label','')}").lower()
+        if all(t in hay for t in terms):
+            res.append(m)
+    return res

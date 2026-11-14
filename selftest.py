@@ -45,6 +45,8 @@ def make_fake_bot():
         "reply_photo",
         "reply_document",
         "edit_message_media",
+        "edit_message_caption",
+        "delete_message",
     ):
         setattr(bot, name, AsyncMock())
     return bot
@@ -379,6 +381,8 @@ async def test_template_matching():
 
 
 async def test_handlers_registered():
+    import re
+
     import main
 
     config.BOT_TOKEN = "123456:TEST-TOKEN"
@@ -390,6 +394,21 @@ async def test_handlers_registered():
         "کیبورد تأیید خاموشی دو دکمه دارد",
         len(main.ui.confirm_shutdown().inline_keyboard) == 1
         and len(main.ui.confirm_shutdown().inline_keyboard[0]) == 2,
+    )
+    #HELP_TEXT با parse_mode="Markdown" فرستاده می‌شود؛ یک علامت * یا _ زوج
+    #نکرده کل پیام /start و /help را با خطای «Can't parse entities» می‌شکند.
+    #داخل `code` تلگرام چیزی تفسیر نمی‌کند، پس اول آن‌ها حذف می‌شوند.
+    stripped = re.sub(r"```.*?```", "", main.HELP_TEXT, flags=re.S)
+    stripped = re.sub(r"`[^`]*`", "", stripped)
+    unpaired = [
+        m
+        for m in ("*", "_")
+        if len(re.findall(re.escape(m), stripped)) % 2 != 0
+    ]
+    check(
+        "MARKDOWN HELP_TEXT علامت‌های * و _ زوج دارد",
+        not unpaired,
+        f"زوج‌نشده: {unpaired}",
     )
 
 
@@ -709,17 +728,41 @@ async def test_no_false_completion_without_template():
     if not handles:
         check("پنجره‌ای برای تست پیدا شد", False, "هیچ پنجره‌ای باز نیست")
         return
-    hwnd = sorted(handles)[0]
+    # اولین پنجره‌ای که rect معتبر و روی صفحه داشته باشد را انتخاب کن؛
+    # پنجره‌های minimize شده مختصات -32000 دارند و اگر انتخاب شوند،
+    # chat_region نامعتبر می‌شود، crop_by_ratio برمی‌گرداند None و حلقه‌ی
+    # _wait_for_completion تا OPENCODE_TIMEOUT (چند دقیقه) می‌چرخد
+    # و تست با timeout مواجه می‌شود (flaky بودن قبلی همین بود).
+    sw, sh = 1920, 1080
+    try:
+        sw, sh = __import__("pyautogui").size()
+    except Exception:
+        pass
+    hwnd = None
+    for h in sorted(handles):
+        rect = windows.window_rect(h)
+        if rect is None:
+            continue
+        left, top, right, bottom = rect
+        # روی صفحه باشد و اندازه‌ی معقول داشته باشد
+        if right > left > -1000 and bottom > top > -1000 and (right - left) > 50 and (bottom - top) > 50:
+            hwnd = h
+            break
+    if hwnd is None:
+        check("پنجره‌ای برای تست پیدا شد", False, "پنجره‌ای با rect معتبر روی صفحه نیست")
+        return
 
     old_tpl = config.OPENCODE_TEMPLATE_STOP
     old_idle = config.OPENCODE_IDLE_COMPLETE_SECONDS
     old_poll = config.OPENCODE_POLL_INTERVAL
+    old_timeout = config.OPENCODE_TIMEOUT
     old_grab = imaging.grab_screen_async
     old_is_alive = opencode._window_alive
 
     config.OPENCODE_TEMPLATE_STOP = "definitely_missing.png"
     config.OPENCODE_IDLE_COMPLETE_SECONDS = 4.0
     config.OPENCODE_POLL_INTERVAL = 0.3
+    config.OPENCODE_TIMEOUT = 15.0  # فقط برای تست؛ جلوی دویدن طولانی را می‌گیرد
     imaging._template_cache.pop("definitely_missing.png", None)
 
     static = await old_grab()
@@ -759,6 +802,7 @@ async def test_no_false_completion_without_template():
         config.OPENCODE_TEMPLATE_STOP = old_tpl
         config.OPENCODE_IDLE_COMPLETE_SECONDS = old_idle
         config.OPENCODE_POLL_INTERVAL = old_poll
+        config.OPENCODE_TIMEOUT = old_timeout
         imaging.grab_screen_async = old_grab
         opencode._window_alive = old_is_alive
 
@@ -895,13 +939,17 @@ async def test_button_matching():
     from core import ui
 
     positives = [
-        ui.BTN_SCREENSHOT, ui.BTN_APPS, ui.BTN_PROMPT, ui.BTN_SHUTDOWN,
-        ui.BTN_TABS,
+        ui.BTN_SCREENSHOT, ui.BTN_CAMERA, ui.BTN_APPS, ui.BTN_PROMPT, ui.BTN_SHUTDOWN,
+        ui.BTN_TABS, ui.BTN_MOUSE, ui.BTN_GOOGLE,
         "  📸 اسکرین‌شات  ",
         "📸اسکرین‌شات",
         "اسکرین‌شات",
         "📸 اسکرين‌شات",          # ی عربی
         "📸عکس از صفحه",
+        "📷 دوربین",
+        "دوربین",
+        "عکس دوربین",
+        "webcam",
         "⏻ خاموش کردن لپ‌تاپ",
         "تب مرورگر",
         "مرورگر",
@@ -929,6 +977,83 @@ async def test_button_matching():
         "درخواست عادی دکته نیست",
         not ui.looks_like_button("یک درخواست جدید برایت دارم"),
     )
+
+
+async def test_camera_selection():
+    """
+    سیستم انتخاب دوربین: شناسایی، ذخیره در settings.json، و استفاده از
+    ایندکس ذخیره‌شده توسط /camera.
+
+    دوربین واقعی تست نمی‌شود؛ فقط منطق ذخیره/بازخوانی و UI شبیه‌سازی می‌شود.
+    """
+    import json
+    import os as _os
+
+    from core import imaging, ui
+
+    # ذخیره در فایل موقت تا settings.json اصلی خراب نشود
+    old_file = config.SETTINGS_FILE
+    old_cache = imaging._camera_settings_cache
+    tmp_file = os.path.join(config.DATA_DIR, "_test_camera_settings.json")
+    config.SETTINGS_FILE = tmp_file
+    imaging._camera_settings_cache = None
+    try:
+        if _os.path.exists(tmp_file):
+            _os.remove(tmp_file)
+
+        # پیش‌فرض: ایندکس 0
+        check("ایندکس پیش‌فرض دوربین 0 است", imaging.saved_camera_index() == 0)
+
+        # ذخیره‌ی ایندکس دلخواه
+        imaging.set_camera_index(2)
+        check("ایندکس 2 ذخیره شد", imaging.saved_camera_index() == 2)
+
+        # بعد از پاک کردن کش، از فایل خوانده شود
+        imaging._camera_settings_cache = None
+        check("ایندکس بعد از reload هم 2 است", imaging.saved_camera_index() == 2)
+
+        # فایل JSON باید معتبر باشد و کلید camera_index داشته باشد
+        with open(tmp_file, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        check("فایل settings کلید camera_index دارد", saved.get("camera_index") == 2, str(saved))
+
+        # کیبورد انتخاب دوربین
+        cams = [
+            {"index": 0, "width": 640, "height": 480},
+            {"index": 1, "width": 1280, "height": 720},
+        ]
+        kb = ui.camera_select_keyboard(cams, current_index=2)
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        check("دکمه‌ی انتخاب دوربین 0 در کیبورد هست", "camera_set:0" in datas)
+        check("دکمه‌ی انتخاب دوربین 1 در کیبورد هست", "camera_set:1" in datas)
+        check("دکمه‌ی شناسایی دوباره در کیبورد هست", "camera_detect" in datas)
+        check("دکمه‌ی بازگشت در کیبورد هست", "camera_back" in datas)
+
+        # کیبورد زیر عکس دوربین
+        kb2 = ui.camera_photo_keyboard()
+        datas2 = [b.callback_data for row in kb2.inline_keyboard for b in row]
+        check("دکمه‌ی تنظیم دوربین زیر عکس هست", "camera_detect" in datas2)
+
+        # callback ذخیره از طریق main
+        import main
+
+        old_set = imaging.set_camera_index
+        saved_calls = []
+        imaging.set_camera_index = lambda i: saved_calls.append(i)
+
+        u = make_callback("camera_set:5")
+        ctx = make_context()
+        await main.on_callback(u, ctx)
+        check("callback camera_set ایندکس را ذخیره کرد", saved_calls == [5], str(saved_calls))
+        check("پیام تأیید ذخیره فرستاده شد",
+              any("ذخیره شد" in str(c) for c in u.callback_query.edit_message_text.call_args_list))
+
+        imaging.set_camera_index = old_set
+    finally:
+        config.SETTINGS_FILE = old_file
+        imaging._camera_settings_cache = old_cache
+        if _os.path.exists(tmp_file):
+            _os.remove(tmp_file)
 
 
 async def test_app_launch_no_not_modified():
@@ -1642,21 +1767,40 @@ async def test_input_region_lands_inside_textarea():
         f"عرض ناحیه = {box[2] - box[0]} از {right - left}",
     )
 
-    # نقطه‌های کلیک هم باید داخل همین کادر باشند
+    # نقطه‌های کلیک: باید داخل پنجره باشند؛ اولویت با نقاط داخل کادر پیکربندی‌شده است.
     points = opencode._input_click_points(hwnd)
-    inside = all(opencode._inside_box(p, box) for p in points) if points else False
-    check("همه‌ی نقاط کلیک داخل کادر ورودی هستند", inside, str(points)[:120])
+    if rect and points:
+        lft, tp, rgt, btm = rect
+        in_window = all(lft <= p[0] <= rgt and tp <= p[1] <= btm for p in points)
+    else:
+        in_window = False
+    check("همه‌ی نقاط کلیک داخل پنجره هستند", in_window, str(points)[:120])
+
+    inside_points = [p for p in points if opencode._inside_box(p, box)]
+    check("حداقل یک نقطه داخل کادر ورودی وجود دارد",
+          len(inside_points) >= 1, f"داخل کادر: {len(inside_points)} از {len(points)}")
+    # اگر نقطه‌ای بیرون از کادر آمده (مثلاً UIA به‌عنوان تلاش آخر)، باید بعد از
+    # همه‌ی نقاط داخل کادر باشد تا اولویت با ناحیه‌ی پیکربندی‌شده بماند.
+    if len(inside_points) < len(points):
+        first_out = next(i for i, p in enumerate(points) if not opencode._inside_box(p, box))
+        check("نقطه‌ی بیرون از کادر فقط به‌عنوان تلاش آخر می‌آید",
+              first_out >= len(inside_points), str(points)[:120])
     check("چند نقطه برای تلاش مجدد وجود دارد",
           len(points) >= 3, f"{len(points)} نقطه")
 
-    # نقطه‌ی UI Automation نباید بیرون از کادر وارد فهرست شود
+    # نقطه‌ی UI Automation: اگر بیرون از کادر ولی داخل پنجره باشد، به‌عنوان
+    # تلاش آخر پذیرفته می‌شود (برای وقتی رابط عوض شده)؛ نباید حذف شود.
     bad = opencode._uia_input_point(hwnd)
     if bad:
-        check(
-            "نقطه‌ی UI Automation بیرون از کادر فیلتر می‌شود",
-            bad not in points,
-            f"UIA={bad}",
-        )
+        if opencode._inside_box(bad, box):
+            check("نقطه‌ی UI Automation داخل کادر در فهرست است",
+                  bad in points, f"UIA={bad}")
+        elif rect and (rect[0] <= bad[0] <= rect[2] and rect[1] <= bad[1] <= rect[3]):
+            check("نقطه‌ی UI Automation بیرون از کادر به‌عنوان تلاش آخر نگه داشته می‌شود",
+                  bad in points and points[-1] == bad, f"UIA={bad} points={points}")
+        else:
+            check("نقطه‌ی UI Automation بیرون از پنجره فیلتر می‌شود",
+                  bad not in points, f"UIA={bad}")
 
 
 async def test_changed_pixels_is_scale_independent():
@@ -1750,6 +1894,13 @@ async def test_telegram_timeouts_are_generous():
         config.TELEGRAM_POOL_SIZE >= 4,
         f"{config.TELEGRAM_POOL_SIZE}",
     )
+    # درخواست getUpdates (long-poll) باید از timeout پیش‌فرض ۵ ثانیه بزرگ‌تر
+    # باشد وگرنه همیشه قبل از پاسخ ده‌ثانیه‌ای تلگرام «Timed out» می‌گیرد.
+    check(
+        "timeout خواندن getUpdates از long-poll (۱۰ ثانیه) بیشتر است",
+        config.TELEGRAM_POLL_READ_TIMEOUT > 10,
+        f"{config.TELEGRAM_POLL_READ_TIMEOUT}",
+    )
 
 
 async def test_request_object_uses_config():
@@ -1767,6 +1918,28 @@ async def test_request_object_uses_config():
         check("شیء request ساخته شد", req is not None)
         check("نام درست کلاس است",
               type(req).__name__ == "HTTPXRequest", type(req).__name__)
+        # PTB برای polling یک request جدا می‌سازد؛ اگر build_app آن را
+        # تنظیم نکرده باشد، request پیش‌فرض ۵ ثانیه‌ای برمی‌گردد و بات
+        # هیچ پیامی نمی‌گیرد.
+        poll_req = main._build_poll_request()
+        check("شیء request جداگانه‌ی getUpdates ساخته شد", poll_req is not None)
+        check(
+            "timeout خواندن request polling از پیش‌فرض httpx بیشتر است",
+            poll_req.read_timeout > 10,
+            f"{poll_req.read_timeout}",
+        )
+        app = main.build_app()
+        # ترتیب tuple داخل Bot: (شیء getUpdates، شیء معمولی) — برعکسِ چیزی که
+        # آدم انتظار دارد؛ index صفر همان درخواست polling است.
+        check(
+            "build_app شیء request جدا برای getUpdates ثبت کرده",
+            app.bot._request[0] is not app.bot._request[1],
+        )
+        check(
+            "read_timeout شیء getUpdates مقدار تنظیم‌شده است",
+            app.bot._request[0].read_timeout == config.TELEGRAM_POLL_READ_TIMEOUT,
+            f"{app.bot._request[0].read_timeout}",
+        )
     finally:
         _logging.disable(_logging.NOTSET)
 
@@ -2132,19 +2305,41 @@ async def test_mouse_control_mode():
     }
 
     m.position = lambda: (500, 300)
-    m.annotated_screenshot = lambda: Image.new("RGB", (80, 60), (20, 20, 20))
+    m.annotated_screenshot = (
+        lambda max_width=None, screen_size=None: Image.new("RGB", (80, 60), (20, 20, 20))
+    )
     m.move = lambda d, s: calls["move"].append((d, s)) or (500, 300)
     m.click = lambda k: calls["click"].append(k)
-    m.scroll = lambda d: calls["scroll"].append(d)
+    m.scroll = lambda d, amount=3: calls["scroll"].append((d, amount))
     m.press = lambda k: calls["key"].append(k)
     m.combo = lambda k: calls["combo"].append(k)
     m.hold = lambda: calls.__setitem__("hold", calls["hold"] + 1)
     m.release = lambda: calls.__setitem__("release", calls["release"] + 1)
     m.set_text = lambda t: calls["text"].append(t)
 
+    # ماک‌های windows برای refocus و جابجایی پنجره (بدون دست زدن به ویندوز واقعی)
+    wcalls = {"fg": 0, "front": [], "list": []}
+    old_w = {
+        name: getattr(main.windows, name)
+        for name in ("foreground", "is_window", "is_foreground",
+                     "bring_to_front", "list_windows")
+    }
+    main.windows.foreground = lambda: 7777
+    main.windows.is_window = lambda h: True
+    main.windows.is_foreground = lambda h: True
+    main.windows.bring_to_front = (
+        lambda h: wcalls["front"].append(h) or True
+    )
+    main.windows.list_windows = lambda: [
+        {"hwnd": 1111, "title": "Google Chrome"},
+        {"hwnd": 2222, "title": "opencode"},
+        {"hwnd": 3333, "title": ""},
+    ]
+
     def cb(data: str):
         up = make_callback(data)
         up.callback_query.edit_message_media = AsyncMock()
+        up.callback_query.edit_message_caption = AsyncMock()
         up.callback_query.edit_message_reply_markup = AsyncMock()
         return up
 
@@ -2163,6 +2358,11 @@ async def test_mouse_control_mode():
         kb = ctx.bot.send_photo.call_args.kwargs.get("reply_markup")
         check("کیبورد کنترل ماوس دکمه‌ی فلش دارد",
               kb is not None and "mouse:mv:up" in str(kb))
+
+        # دکمه‌ی «ورود» روی پیام راهنما هم وارد حالت می‌کند
+        await main.on_callback(cb("mouse_enter"), ctx)
+        check("دکمه‌ی راهنما حالت ماوس را فعال می‌کند",
+              s.get("mode") == "mouse")
 
         # --- حرکت با گام پیش‌فرض
         u = cb("mouse:mv:up")
@@ -2190,10 +2390,77 @@ async def test_mouse_control_mode():
               str(calls["click"]))
         check("نگه/رها برای درگ انجام شد",
               calls["hold"] == 1 and calls["release"] == 1)
-        check("اسکرول انجام شد", calls["scroll"] == ["up"], str(calls["scroll"]))
+        check("اسکرول با گام پیش‌فرض انجام شد",
+              calls["scroll"] == [("up", 12)], str(calls["scroll"]))
         check("کلید Enter ارسال شد", calls["key"] == ["enter"], str(calls["key"]))
         check("ترکیب Ctrl+C ارسال شد", calls["combo"] == ["ctrl+c"],
               str(calls["combo"]))
+
+        # --- گام اسکرول (مقدار ثابت ۳ روی بعضی مرورگرها دیده نمی‌شود)
+        check("گام اسکرول پیش‌فرض ۱۲ است", s.get("scroll_step") == 12,
+              str(s.get("scroll_step")))
+        await main.on_callback(cb("mouse:sstep:up"), ctx)
+        check("گام اسکرول زیاد می‌شود", s.get("scroll_step") == 25,
+              str(s.get("scroll_step")))
+        await main.on_callback(cb("mouse:scroll:up"), ctx)
+        check("اسکرول بعدی با گام جدید است",
+              calls["scroll"][-1] == ("up", 25), str(calls["scroll"][-1]))
+        await main.on_callback(cb("mouse:sstep:down"), ctx)
+        check("گام اسکرول کم می‌شود", s.get("scroll_step") == 12,
+              str(s.get("scroll_step")))
+
+        # --- شورتکات: هدف (پنجره‌ی فعال هنگام ورود) باید جلو باشد
+        # اگر تلگرام دسکتاپ فوکوس گرفته باشد، Ctrl+C به تلگرام می‌خورد نه مقصد
+        check("target_hwnd هنگام ورود ثبت شد", s.get("target_hwnd") == 7777,
+              str(s.get("target_hwnd")))
+        main.windows.is_foreground = lambda h: False  # تلگرام فوکوس گرفته
+        await main.on_callback(cb("mouse:combo:ctrl+c"), ctx)
+        check("قبل از ترکیب، هدف دوباره جلو می‌آید",
+              7777 in wcalls["front"], str(wcalls["front"]))
+        main.windows.is_foreground = lambda h: True  # بازگردانی برای بقیه‌ی تست
+
+        # --- جابجایی بین پنجره‌های باز (مثل تب‌های مرورگر)
+        u = cb("mouse:winlist")
+        await main.on_callback(u, ctx)
+        pick = u.callback_query.message.reply_text.call_args
+        check("لیست پنجره‌های باز فرستاده می‌شود",
+              pick is not None
+              and "Google Chrome" in str(pick)
+              and "opencode" in str(pick),
+              str(pick)[:200])
+        check("پنجره‌ی عنوان‌خالی در لیست نیست", "3333" not in str(pick),
+              str(pick)[:200])
+        pick_kb = pick.kwargs.get("reply_markup") if pick else None
+        check("کیبورد انتخاب پنجره، بازگشت دارد",
+              pick_kb is not None and "mouse:winback" in str(pick_kb),
+              str(pick_kb))
+        check("شناسه‌ی پیام انتخاب ذخیره شد", s.get("win_pick_msg") is not None,
+              str(s.get("win_pick_msg")))
+
+        u = cb("mouse:win:1")  # opencode (دومی)
+        await main.on_callback(u, ctx)
+        check("پنجره‌ی انتخابی جلو می‌آید", 2222 in wcalls["front"],
+              str(wcalls["front"]))
+        check("target_hwnd به پنجره‌ی انتخابی عوض شد", s.get("target_hwnd") == 2222,
+              str(s.get("target_hwnd")))
+        check("پیام انتخاب بعد از انتخاب حذف می‌شود", s.get("win_pick_msg") is None,
+              str(s.get("win_pick_msg")))
+
+        # بازگشت از انتخاب
+        u = cb("mouse:winlist")
+        await main.on_callback(u, ctx)
+        u2 = cb("mouse:winback")
+        await main.on_callback(u2, ctx)
+        check("بازگشت، پیام انتخاب را حذف می‌کند", s.get("win_pick_msg") is None,
+              str(s.get("win_pick_msg")))
+
+        # --- دکمه‌های مرورگر (برای بعد از جست‌وجوی گوگل)
+        for data in ("mouse:combo:alt+left", "mouse:key:f5"):
+            await main.on_callback(cb(data), ctx)
+        check("بازگشت صفحه (Alt+Left) ارسال می‌شود",
+              calls["combo"][-1] == "alt+left", str(calls["combo"]))
+        check("تازه‌سازی (F5) ارسال می‌شود",
+              calls["key"][-1] == "f5", str(calls["key"]))
 
         # --- تایپ متن (فارسی) در نقطه‌ی انتخاب‌شده با ماوس
         # اگر شاخه‌ی حالت ماوس کار نکند، متن به ساخت پرامپت می‌رسد؛ پس
@@ -2221,13 +2488,21 @@ async def test_mouse_control_mode():
         check("دکمه‌ی منو حالت ماوس را می‌بندد",
               ctx.user_data["session"].get("mode") != "mouse")
 
-        # --- خروج با دکمه‌ی خروج
+        # --- خروج با دکمه‌ی خروج → صفحه‌ی «تایپ در مکان سلکت‌شده / کنسل»
         ctx.user_data["session"]["mode"] = "mouse"
         u = cb("mouse:exit")
         await main.on_callback(u, ctx)
         check("خروج از حالت ماوس", ctx.user_data["session"].get("mode") == "")
-        check("کیبورد شناور بعد از خروج برداشته می‌شود",
-              u.callback_query.edit_message_reply_markup.called)
+        exit_cap = u.callback_query.edit_message_caption.call_args
+        exit_kb = exit_cap.kwargs.get("reply_markup") if exit_cap else None
+        check("صفحه‌ی خروج دکمه‌های تایپ و کنسل را نشان می‌دهد",
+              exit_kb is not None
+              and "mouse:type_ask" in str(exit_kb)
+              and "mouse:type_cancel" in str(exit_kb),
+              str(exit_kb))
+        check("کپشن عکس ویرایش می‌شود، نه متن (edit_message_text صدا نمی‌خورد)",
+              u.callback_query.edit_message_caption.called
+              and not u.callback_query.edit_message_text.called)
 
         # --- دکمه‌ی عکس قدیمی بعد از خروج نباید ماوس را تکان دهد
         before = len(calls["move"])
@@ -2237,6 +2512,27 @@ async def test_mouse_control_mode():
               len(calls["move"]) == before, str(calls["move"]))
         check("به کاربر هشدار داده می‌شود",
               u.callback_query.answer.call_args.kwargs.get("show_alert") is True)
+
+        # --- جریان «وارد کردن متن در مکان سلکت‌شده» بعد از خروج
+        ctx.user_data["session"]["mode"] = ""
+        await main.on_callback(cb("mouse:type_ask"), ctx)
+        check("درخواست تایپ، حالت ورود متن را فعال می‌کند",
+              ctx.user_data["session"].get("mode") == "mouse_type",
+              str(ctx.user_data["session"].get("mode")))
+        await main.on_text(make_update(111111111, text="متن انتخابی"), ctx)
+        check("متنِ درخواستی در مکان سلکت‌شده چسبانده می‌شود",
+              calls["text"][-1] == "متن انتخابی", str(calls["text"]))
+        check("بعد از تایپ حالت بسته می‌شود",
+              ctx.user_data["session"].get("mode") != "mouse_type")
+        check("عکس پیام «چسبانده شد» می‌گیرد",
+              ctx.bot.edit_message_caption.called)
+
+        # --- کنسلِ جریان تایپ
+        ctx.user_data["session"]["mode"] = "mouse_type"
+        u = cb("mouse:type_cancel")
+        await main.on_callback(u, ctx)
+        check("کنسل، حالت را می‌بندد",
+              ctx.user_data["session"].get("mode") == "")
 
         # --- دکمه‌ی ناشناخته اجرا نمی‌شود
         ctx.user_data["session"]["mode"] = "mouse"
@@ -2248,17 +2544,478 @@ async def test_mouse_control_mode():
         # --- صحت‌سنجی کیبورد
         datas = [
             b.callback_data
-            for row in main.ui.mouse_keyboard(50).inline_keyboard
+            for row in main.ui.mouse_keyboard(50, 12).inline_keyboard
             for b in row
         ]
         check("callback_dataهای ماوس زیر سقف ۶۴ بایت تلگرام‌اند",
               all(len(d.encode("utf-8")) <= 64 for d in datas))
         check("دکمه‌ی خروج در کیبورد هست", "mouse:exit" in datas)
+        check("دکمه‌ی انتخاب گام اسکرول در کیبورد هست", "mouse:sstep:up" in datas)
+        check("دکمه‌ی لیست پنجره‌ها در کیبورد هست", "mouse:winlist" in datas)
         flat = [b.text for row in main.ui.main_menu().keyboard for b in row]
         check("دکمه‌ی ماوس در منوی اصلی است", main.ui.BTN_MOUSE in flat, str(flat))
     finally:
         for name, fn in old.items():
             setattr(m, name, fn)
+        for name, fn in old_w.items():
+            setattr(main.windows, name, fn)
+
+
+async def test_google_search():
+    """
+    جست‌وجوی گوگل: لینک درست باز شود و حالت ماوس خودکار فعال شود.
+
+    os.startfile نباید واقعاً مرورگر را باز کند؛ پس ماک می‌شود.
+    """
+    import main
+    from core import mouse as m
+    from PIL import Image
+
+    opened = []
+    old_startfile = os.startfile
+    old_find = main.windows.find_window
+    old_focus = main.windows.focus
+    old_shot = m.annotated_screenshot
+    old_pos = m.position
+
+    os.startfile = lambda url: opened.append(url)
+    main.windows.find_window = lambda kws: None
+    main.windows.focus = lambda hwnd: True
+    m.annotated_screenshot = (
+        lambda max_width=None, screen_size=None: Image.new("RGB", (80, 60), (10, 10, 10))
+    )
+    m.position = lambda: (100, 100)
+    try:
+        # ورود با دکمه‌ی منو → حالت انتظار جست‌وجو
+        ctx = make_context()
+        await main.on_text(make_update(111111111, text=main.ui.BTN_GOOGLE), ctx)
+        check("دکمه‌ی گوگل حالت جست‌وجو را فعال می‌کند",
+              ctx.user_data["session"].get("mode") == "google",
+              str(ctx.user_data["session"].get("mode")))
+
+        # ارسال متن → باز شدن لینک + فعال شدن حالت ماوس
+        await main.on_text(make_update(111111111, text="open code tutorial"), ctx)
+        check("لینک جست‌وجوی گوگل باز شد",
+              len(opened) == 1
+              and opened[0].startswith("https://www.google.com/search?q="),
+              str(opened))
+        check("متن در لینک کدگذاری شد",
+              bool(opened) and "open%20code%20tutorial" in opened[0],
+              opened[0] if opened else "")
+        check("بعد از جست‌وجو حالت ماوس خودکار فعال می‌شود",
+              ctx.user_data["session"].get("mode") == "mouse",
+              str(ctx.user_data["session"].get("mode")))
+        check("عکس حالت ماوس هم فرستاده شد", ctx.bot.send_photo.called)
+
+        # دستور /google با آرگومان → سریع جست‌وجو (فارسی کدگذاری می‌شود)
+        ctx2 = make_context()
+        ctx2.args = ["پایتون", "آموزش"]
+        await main.cmd_google(make_update(111111111, text="/google"), ctx2)
+        check("دستور /google با آرگومان سریع جست‌وجو می‌کند",
+              len(opened) == 2
+              and opened[1].startswith("https://www.google.com/search?q=")
+              and "%" in opened[1],
+              str(opened))
+
+        # دستور /google بدون آرگومان → حالت انتظار
+        ctx3 = make_context()
+        ctx3.args = []
+        await main.cmd_google(make_update(111111111, text="/google"), ctx3)
+        check("/google بدون آرگومان حالت انتظار را فعال می‌کند",
+              ctx3.user_data["session"].get("mode") == "google")
+    finally:
+        os.startfile = old_startfile
+        main.windows.find_window = old_find
+        main.windows.focus = old_focus
+        m.annotated_screenshot = old_shot
+        m.position = old_pos
+
+
+def _stream_loop_src() -> str:
+    """کدِ تابع _handle_stream، برای بازرسی رفتار استریم."""
+    import inspect
+    from core import remote as _r
+
+    return inspect.getsource(_r._Handler._handle_stream)
+
+
+async def test_remote_console():
+    """
+    کنسول ریموت وب: صفحه با توکن، رد شدن بدون توکن، فرمان ماوس، استریم، توقف.
+
+    تونل کلودفلر و دانلود binary در تست واقعی نمی‌شوند؛ فقط HTTP محلی
+    (start با tunnel=False) و جدا کردن آدرس از خروجی تست می‌شود.
+    """
+    import json as _json
+    import threading as _threading
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    import main
+    from core import mouse as m
+    from core import remote as rem
+    from PIL import Image
+
+    # جدا کردن آدرس تونل از خروجی cloudflared
+    sample = "INF |  https://abc-123-def.trycloudflare.com  | some"
+    check("آدرس تونل از خروجی cloudflared پیدا می‌شود",
+          rem.parse_tunnel_url(sample) == "https://abc-123-def.trycloudflare.com",
+          sample)
+    check("متن بدون تونل آدرس نمی‌دهد", rem.parse_tunnel_url("hello world") is None)
+    # باگ لینک /remote: آدرس پایه‌ی تونل باید مسیر /R/<token>/ بگیرد،
+    # وگرنه مرورگر به / می‌رود و «not found» برمی‌گردد
+    check("مسیر صفحه به آدرس پایه‌ی تونل اضافه می‌شود",
+          rem._page_url("https://abc-123-def.trycloudflare.com", "tok1")
+          == "https://abc-123-def.trycloudflare.com/R/tok1/")
+    check("اسلش اضافی در پایه تکرار نمی‌شود",
+          rem._page_url("https://x.trycloudflare.com/", "t")
+          == "https://x.trycloudflare.com/R/t/")
+
+    old = {
+        "shot": m.annotated_screenshot,
+        "pos": m.position,
+        "move_abs": m.move_abs,
+        "click": m.click,
+        "hold": m.hold,
+        "release": m.release,
+        "scroll": m.scroll,
+        "press": m.press,
+        "combo": m.combo,
+        "set_text": m.set_text,
+    }
+    calls = {k: [] for k in (
+        "move_abs", "click", "hold", "release", "scroll", "press", "combo", "set_text",
+    )}
+    # آرگومان‌های اختیاری را می‌پذیرد: _capture_loop در کنسول ریموت
+    # max_width و screen_size می‌دهد تا تصویر قبل از annotate کوچک شود.
+    m.annotated_screenshot = (
+        lambda max_width=None, screen_size=None: Image.new("RGB", (80, 60), (20, 20, 20))
+    )
+    m.position = lambda: (11, 22)
+    m.move_abs = lambda x, y: calls["move_abs"].append((x, y)) or (x, y)
+    m.click = lambda kind, pause=None: calls["click"].append(kind)
+    m.hold = lambda pause=None: calls["hold"].append(True)
+    m.release = lambda pause=None: calls["release"].append(True)
+    m.scroll = lambda d, amount=3, pause=None: calls["scroll"].append((d, amount))
+    m.press = lambda k, pause=None: calls["press"].append(k)
+    m.combo = lambda c, pause=None: calls["combo"].append(c)
+    m.set_text = lambda t: calls["set_text"].append(t)
+
+    console = rem.console
+
+    # ماک windows برای refocus کنسول ریموت (do_key/do_text هدف را جلو می‌آورد)
+    old_w = {
+        name: getattr(rem.windows, name)
+        for name in ("foreground", "is_window", "is_foreground", "bring_to_front")
+    }
+    rem.windows.foreground = lambda: 9999
+    rem.windows.is_window = lambda h: True
+    rem.windows.is_foreground = lambda h: True
+    rem.windows.bring_to_front = lambda h: True
+
+    def fetch(url):
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, r.read(65536), dict(r.headers)
+
+    def fetch_err(url):
+        try:
+            urllib.request.urlopen(url, timeout=5)
+            return 200
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+
+    def post(base, path, payload):
+        data = _json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            base + path, data=data, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        await asyncio.to_thread(console.start, tunnel=False)
+        st = console.status()
+        check("سرور کنسول بالا است", bool(st["running"]), str(st))
+        check("آدرس start مسیر /R/ دارد (باگ لینک not-found)",
+              st["url"] is not None and "/R/" in st["url"] and
+              st["url"].endswith(f"/R/{console.token}/"),
+              str(st["url"]))
+        base = f"http://127.0.0.1:{st['port']}/R/{console.token}"
+
+        # صفحه با توکن
+        code, body, _h = await asyncio.to_thread(fetch, base + "/")
+        check("صفحه‌ی کنسول با توکن باز می‌شود",
+              code == 200 and b"<img" in body and b"stream" in body,
+              f"code={code}")
+
+        # بدون توکن درست
+        code2 = await asyncio.to_thread(
+            fetch_err, f"http://127.0.0.1:{st['port']}/R/wrong/"
+        )
+        check("بدون توکن درست، دسترسی رد می‌شود", code2 == 404, str(code2))
+
+        # فرمان‌های ماوس
+        c1 = await asyncio.to_thread(post, base, "/mouse", {"action": "move", "x": 15, "y": 25})
+        c2 = await asyncio.to_thread(
+            post, base, "/mouse", {"action": "click", "kind": "double", "x": 5, "y": 6}
+        )
+        c3 = await asyncio.to_thread(post, base, "/mouse", {"action": "down", "x": 1, "y": 2})
+        c4 = await asyncio.to_thread(post, base, "/mouse", {"action": "up"})
+        c5 = await asyncio.to_thread(post, base, "/mouse", {"action": "scroll", "dir": "down"})
+        check("فرمان move به move_abs رسید",
+              c1 == 200 and (15, 25) in calls["move_abs"], str(calls["move_abs"]))
+        check("فرمان click دوباره اجرا شد",
+              c2 == 200 and "double" in calls["click"], str(calls["click"]))
+        check("درگ (down/up) اجرا شد",
+              c3 == 200 and c4 == 200
+              and calls["hold"] == [True] and calls["release"] == [True])
+        check("اسکرول با گام پیش‌فرض اجرا شد",
+              c5 == 200 and calls["scroll"] == [("down", 12)],
+              str(calls["scroll"]))
+
+        # کلید، ترکیب، متن
+        k1 = await asyncio.to_thread(post, base, "/key", {"key": "enter"})
+        k2 = await asyncio.to_thread(post, base, "/key", {"combo": "ctrl+v"})
+        k3 = await asyncio.to_thread(post, base, "/key", {"key": "bogus"})
+        t1 = await asyncio.to_thread(post, base, "/text", {"text": "سلام"})
+        check("تک‌کلید اجرا می‌شود", k1 == 200 and calls["press"] == ["enter"],
+              str(calls["press"]))
+        check("ترکیب ctrl+v اجرا می‌شود", k2 == 200 and calls["combo"] == ["ctrl+v"],
+              str(calls["combo"]))
+        check("کلید ناشناخته رد می‌شود", k3 == 400, str(k3))
+        check("متن به چسباندن می‌رود", t1 == 200 and calls["set_text"] == ["سلام"],
+              str(calls["set_text"]))
+
+        # alt+tab: سویچ بین پنجره‌های باز ویندوز (دکمه‌ی موبایل)
+        k4 = await asyncio.to_thread(post, base, "/key", {"combo": "alt+tab"})
+        check("ترکیب alt+tab اجرا می‌شود", k4 == 200 and "alt+tab" in calls["combo"],
+              str(calls["combo"]))
+        k5 = await asyncio.to_thread(post, base, "/key", {"combo": "alt+shift+tab"})
+        check("ترکیب alt+shift+tab اجرا می‌شود",
+              k5 == 200 and "alt+shift+tab" in calls["combo"], str(calls["combo"]))
+
+        # کندی کنترل: مکث بعد از هر عمل در رابط وب باید خیلی کم باشد.
+        # پیش‌فرضِ مخصوص تلگرام (MOUSE_ACTION_PAUSE = 0.15) برای پیام‌های
+        # تکی خوب است ولی در کنسول ریموت که فرمان‌ها تعاملی و پشت‌سرهم‌اند
+        # حس کندی می‌داد.
+        check("مکث فرمان‌های ریموت خیلی کمتر از تلگرام است",
+              config.REMOTE_ACTION_PAUSE < config.MOUSE_ACTION_PAUSE / 4,
+              f"remote={config.REMOTE_ACTION_PAUSE} telegram={config.MOUSE_ACTION_PAUSE}")
+        # ثبت هدف پنجره نباید با هر کلیک انجام شود (دو فراخوانی win32)
+        check("هدف پنجره با هر کلیک تازه نمی‌شود",
+              int(config.REMOTE_REMEMBER_EVERY) > 1,
+              str(config.REMOTE_REMEMBER_EVERY))
+
+        # صفحه باید ریسپانسیو باشد و دکمه‌های موبایل را داشته باشد
+        page = ""
+        with urllib.request.urlopen(base + "/", timeout=10) as r:
+            page = r.read().decode("utf-8")
+        check("دکمه‌ی Alt+Tab در صفحه‌ی ریموت هست", 'data-c="alt+tab"' in page)
+        check("دکمه‌ی Alt+Shift+Tab در صفحه‌ی ریموت هست",
+              'data-c="alt+shift+tab"' in page)
+        # ریسپانسیو: viewport و media query و حفظ نسبت ابعاد
+        check("viewport برای موبایل تنظیم شده",
+              "width=device-width" in page and "maximum-scale=1" in page)
+        check("media query برای صفحه‌های کوچک هست",
+              "@media (max-width:600px)" in page)
+        check("نسبت ابعاد تصویر با JS حفظ می‌شود", "function fit()" in page)
+        # استریم با HTTP/1.1 و کانال باز (ریشه‌ی رفع 502)
+        check("سرور ریموت روی HTTP/1.1 است",
+              rem._Handler.protocol_version == "HTTP/1.1",
+              rem._Handler.protocol_version)
+
+        # قطع اتصال خشونت‌بار مرورگر/تونل نباید traceback چاپ کند.
+        # با keep-alive هر بار که کلاینت صفحه را ترک می‌کند این اتفاق
+        # می‌افتد و کتابخانه‌ی استاندارد برای هرکدام یک traceback کامل
+        # روی stderr می‌ریخت و کنسول را پر از پیام تکراری می‌کرد.
+        import socket as _socket
+
+        def hard_reset():
+            sk = _socket.create_connection(("127.0.0.1", console._port))
+            sk.sendall(
+                f"GET /R/{console.token}/ HTTP/1.1\r\nHost: x\r\n\r\n".encode()
+            )
+            _time.sleep(0.01)
+            # SO_LINGER با تایم‌صفر یعنی RST به‌جای بستنِ نرم
+            sk.setsockopt(
+                _socket.SOL_SOCKET, _socket.SO_LINGER,
+                b"\x01\x00\x00\x00\x00\x00\x00\x00",
+            )
+            sk.close()
+
+        for _ in range(6):
+            await asyncio.to_thread(hard_reset)
+        await asyncio.sleep(0.3)
+        code_reset = await asyncio.to_thread(fetch_err, base + "/")
+        check("بعد از قطع‌های خشونت‌بار سرور سالم می‌ماند", code_reset == 200,
+              f"status={code_reset}")
+
+        # استریم MJPEG: اولین بایت‌ها باید header multipart باشند
+        #
+        # نکته: با HTTP/1.1 سرور کانال را باز نگه می‌دارد (این همان چیزی است
+        # که خطای ۵۰۲ را رفع می‌کند)، پس اینجا باید فقط «اولین» بسته را
+        # بخوانیم و برگردیم — read(128) صبر می‌کند تا دقیقاً ۱۲۸ بایت شود
+        # و اگر هدر و فریم در دو بسته‌ی جدا برسند، هرگز پر نمی‌شود.
+        def read_stream():
+            with urllib.request.urlopen(base + "/stream", timeout=15) as r:
+                head = r.headers.get("Content-Type", "")
+                # read1 فقط هرچه در بافر هست را برمی‌گرداند (بدون انتظار)
+                chunk = r.read1(4096) if hasattr(r, "read1") else r.read(128)
+                return head, chunk
+
+        head, chunk = await asyncio.to_thread(read_stream)
+        check("استریم MJPEG با boundary پاسخ می‌دهد",
+              "multipart/x-mixed-replace" in head and b"--frame" in chunk,
+              f"{head[:40]} {chunk[:30]!r}")
+
+        # سنجه‌ی تأخیر: نرخ واقعی فریم باید به REMOTE_FPS نزدیک باشد.
+        # حلقه‌ی کپچر فقط وقتی عکس می‌گیرد که بیننده وصل باشد (برای صرفه‌جویی
+        # CPU)، پس باید یک بیننده‌ی زنده نگه داریم وگرنه نرخ صفر می‌شود.
+        # ترد تا پایان اندازه‌گیری باز می‌ماند و جریان را می‌خواند.
+        def hold_stream(seconds):
+            end = _time.time() + seconds
+            with urllib.request.urlopen(base + "/stream", timeout=seconds + 5) as r:
+                while _time.time() < end:
+                    if not r.read1(65536):
+                        break
+
+        holder = _threading.Thread(target=hold_stream, args=(2.0,), daemon=True)
+        holder.start()
+        await asyncio.sleep(0.4)          # فرصت وصل شدن بیننده
+        joined = console._clients
+        n_before = console.hub._seq
+        await asyncio.sleep(1.0)
+        produced = console.hub._seq - n_before
+        check("بیننده‌ی استریم ثبت شد", joined >= 1, f"clients={joined}")
+        check("نرخ فریم استریم نزدیک به مقدار تنظیم‌شده است",
+              produced >= max(2, int(config.REMOTE_FPS * 0.5)),
+              f"{produced} فریم در ۱ ثانیه (هدف={config.REMOTE_FPS})")
+
+        # استریم نباید به‌خاطر timeout (بی‌فریم بودن) بسته شود؛ این رفتار
+        # باعث تأخیر چندثانیه‌ای می‌شد چون مرورگر دوباره وصل می‌شد.
+        src = _stream_loop_src()
+        check("استریم با بی‌فریم‌بودن بسته نمی‌شود",
+              "if jpeg is None:" in src and "break" not in src.split("if jpeg is None:")[1].split("last = seq")[0],
+              src.split("if jpeg is None:")[1].split("last = seq")[0].strip()[:60])
+
+        # توقف
+        await asyncio.to_thread(console.stop)
+        st2 = console.status()
+        check("بعد از stop سرور بسته می‌شود", not st2["running"], str(st2))
+        code3 = await asyncio.to_thread(fetch_err, base + "/")
+        check("بعد از stop درخواست جواب نمی‌گیرد", code3 == 0, str(code3))
+
+        # جریان دستورهای /remote و /remote_stop (ماک remote.start/stop/status)
+        old_start, old_stop, old_status = (
+            main.remote.start, main.remote.stop, main.remote.status,
+        )
+        started = []
+        stopped = []
+
+        def fake_start(timeout=None, provider="cloudflare"):
+            started.append((timeout, provider))
+            return f"https://x.trycloudflare.com/R/tok123/{provider}/"
+
+        main.remote.start = fake_start
+        main.remote.stop = lambda: stopped.append(True) or True
+        main.remote.status = lambda: {"running": False, "url": None, "port": 0, "provider": None}
+        try:
+            # /remote وقتی غیرفعال است باید گزینه‌های تونل را نشان دهد (بدون شروع خودکار)
+            ctx = make_context()
+            u = make_update(111111111, text="/remote")
+            await main.cmd_remote(u, ctx)
+            texts = " ".join(
+                str(c.args[0]) for c in u.effective_message.reply_text.call_args_list
+            )
+            check("دستور /remote گزینه‌های تونل را نشان می‌دهد",
+                  "Cloudflare" in texts and "ngrok" in texts, texts[:120])
+            check("دستور /remote بدون انتخاب تونل را شروع نمی‌کند", started == [], str(started))
+            rm = u.effective_message.reply_text.call_args_list[-1].kwargs.get("reply_markup")
+            check("دستور /remote کیبورد انتخاب تونل دارد", rm is not None)
+
+            # انتخاب Cloudflare از طریق callback → شروع و ارسال لینک
+            main.remote.status = lambda: {"running": False, "url": None, "port": 0, "provider": None}
+            cb = make_callback("remote_start:cloudflare")
+            await main.on_callback(cb, ctx)
+            cb_texts = " ".join(
+                str(c.args[0]) for c in cb.effective_message.reply_text.call_args_list
+            )
+            check("انتخاب Cloudflare تونل را شروع می‌کند",
+                  started == [(None, "cloudflare")], str(started))
+            check("لینک کنسول پس از شروع Cloudflare ارسال می‌شود",
+                  "trycloudflare.com" in cb_texts, cb_texts[:140])
+
+            # انتخاب ngrok از طریق callback
+            main.remote.status = lambda: {"running": False, "url": None, "port": 0, "provider": None}
+            cb_ng = make_callback("remote_start:ngrok")
+            await main.on_callback(cb_ng, ctx)
+            cb_ng_texts = " ".join(
+                str(c.args[0]) for c in cb_ng.effective_message.reply_text.call_args_list
+            )
+            check("انتخاب ngrok تونل را شروع می‌کند",
+                  started[-1] == (None, "ngrok"), str(started))
+            check("لینک کنسول پس از شروع ngrok ارسال می‌شود",
+                  "https://" in cb_ng_texts, cb_ng_texts[:140])
+
+            # از قبل فعال → همان لینک دوباره
+            main.remote.status = lambda: {
+                "running": True,
+                "url": "https://x.trycloudflare.com/R/tok123/",
+                "port": 1,
+                "provider": "cloudflare",
+            }
+            ctx2 = make_context()
+            u2 = make_update(111111111, text="/remote")
+            await main.cmd_remote(u2, ctx2)
+            texts2 = " ".join(
+                str(c.args[0]) for c in u2.effective_message.reply_text.call_args_list
+            )
+            check("وقتی فعال است لینک قبلی دوباره فرستاده می‌شود",
+                  "از قبل فعال" in texts2 and len(started) == 2, texts2[:100])
+
+            # خطای RemoteError در شروع تونل → پیام فارسی
+            def boom(timeout=None, provider="cloudflare"):
+                raise rem.RemoteError("خطای آزمایشی تونل")
+
+            main.remote.start = boom
+            main.remote.status = lambda: {"running": False, "url": None, "port": 0, "provider": None}
+            cb_err = make_callback("remote_start:cloudflare")
+            await main.on_callback(cb_err, ctx)
+            texts3 = " ".join(
+                str(c.args[0])
+                for c in cb_err.effective_message.reply_text.call_args_list
+            )
+            check("خطای RemoteError به کاربر پیام می‌دهد",
+                  "خطای آزمایشی" in texts3, texts3[:120])
+
+            # stop
+            main.remote.stop = lambda: stopped.append(True) or True
+            ctx4 = make_context()
+            u4 = make_update(111111111, text="/remote_stop")
+            await main.cmd_remote_stop(u4, ctx4)
+            texts4 = " ".join(
+                str(c.args[0])
+                for c in u4.effective_message.reply_text.call_args_list
+            )
+            check("/remote_stop کنسول را می‌بندد", stopped == [True], str(stopped))
+            check("/remote_stop پیام تأیید می‌دهد", "بسته شد" in texts4, texts4[:60])
+        finally:
+            main.remote.start = old_start
+            main.remote.stop = old_stop
+            main.remote.status = old_status
+    finally:
+        for name, fn in old.items():
+            setattr(m, name, fn)
+        for name, fn in old_w.items():
+            setattr(rem.windows, name, fn)
+        with contextlib.suppress(Exception):
+            console.stop()
 
 
 async def main():
@@ -2287,6 +3044,7 @@ async def main():
         test_prompt_session_flow,
         test_free_text_starts_prompt,
         test_button_matching,
+        test_camera_selection,
         test_app_launch_no_not_modified,
         test_app_open_already_running,
         test_edit_helper_tolerates_not_modified,
@@ -2311,6 +3069,8 @@ async def main():
         test_open_app_error_not_caused_by_screenshot,
         test_tabs_keyboard_numbers_only,
         test_mouse_control_mode,
+        test_google_search,
+        test_remote_console,
     ):
         try:
             await asyncio.wait_for(fn(), timeout=90)
