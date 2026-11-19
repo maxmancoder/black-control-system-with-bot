@@ -1432,19 +1432,25 @@ def _remember_target(session: Dict[str, object]) -> None:
         session["target_hwnd"] = h
 
 
-def _refocus_target(session: Dict[str, object]) -> None:
+def _refocus_target(session: Dict[str, object]) -> bool:
     """
     قبل از فرستادن کلید/ترکیب/متن، هدف را جلو می‌آورد.
 
-    اگر تلگرام دسکتاپ روی همین کامپیوتر باز باشد، زدنِ دکمه فوکوس را از
-    برنامه‌ی هدف می‌گیرد و شورتکات به جای مقصد به تلگرام می‌خورد؛ بدون این
-    مرحله Ctrl+C در تلگرام «کپی» می‌شود نه در برنامه‌ی هدف.
+    اگر هدف شناخته‌شده باشد و پنجره‌ی دیگری (مثلاً تلگرام دسکتاپ روی همین
+    کامپیوتر) فوکوس گرفته باشد، هدف دوباره جلو آورده می‌شود تا ورودی به
+    پنجره‌ی درست برسد. اگر هدفی شناخته نشده باشد، دست نمی‌زنیم تا پنجره‌ی
+    کلاینت به‌اشتباه هدف نشود.
     """
     h = int(session.get("target_hwnd") or 0)
     if not h or not windows.is_window(h):
-        return
-    if not windows.is_foreground(h):
-        windows.bring_to_front(h)
+        session["target_hwnd"] = 0
+        return False
+    if windows.is_foreground(h):
+        return True
+    ok = windows.bring_to_front(h)
+    if ok:
+        time.sleep(0.03)
+    return ok
 
 
 def _switchable_windows(max_items: int = 10) -> list:
@@ -1611,9 +1617,10 @@ async def cmd_mouse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session["mode"] = _MOUSE_MODE
     session.setdefault("mouse_step", config.MOUSE_STEP_DEFAULT)
     session.setdefault("scroll_step", config.MOUSE_SCROLL_STEP_DEFAULT)
-    # پنجره‌ی فعالِ هنگام ورود را هدف کیبورد نگه می‌داریم تا شورتکات‌ها
-    # (حتی اگر تلگرام دسکتاپ فوکوس را بگیرد) به همان پنجره بخورد.
-    _remember_target(session)
+    # هدف کیبورد: اگر از قبل تنظیم شده (مثلاً پس از فوکوس خودکار مرورگر)
+    # دست نمی‌زنیم؛ در غیر این صورت فعلاً خالی می‌ماند تا با اولین
+    # کلیک/انتخاب پنجره به‌درستی ثبت شود و پنجره‌ی کلاینتِ چت به‌اشتباه
+    # هدف نشود.
     # پیام قبلی حالت را فراموش می‌کنیم تا عکس تازه، شناسه‌ی تازه بگیرد
     session.pop("mouse_msg", None)
 
@@ -1680,8 +1687,16 @@ async def _google_search(
     )
 
     await asyncio.sleep(config.GOOGLE_OPEN_DELAY)
-    await asyncio.to_thread(_focus_browser)
+    focused = await asyncio.to_thread(_focus_browser)
     await asyncio.sleep(config.GOOGLE_RENDER_DELAY)
+
+    # هدف کیبورد را مرورگرِ نتایج قرار می‌دهیم تا پس از ورود به حالت ماوس،
+    # کلید/متن به آن برود (cmd_mouse دیگر هدف را حدس نمی‌زند).
+    session = _session(context)
+    if focused:
+        session["target_hwnd"] = windows.foreground()
+    else:
+        session.pop("target_hwnd", None)
 
     # فعال‌سازی خودکار کنترل ماوس روی صفحه‌ی نتایج
     await cmd_mouse(update, context)
@@ -1997,9 +2012,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             session["mode"] = ""
         else:
             try:
-                # اول هدف را جلو می‌آوریم؛ وگرنه اگر تلگرام دسکتاپ فوکوس
-                # گرفته باشد، چسباندن در پنجره‌ی تلگرام انجام می‌شود نه مقصد
-                _refocus_target(session)
+                # اول هدف را جلو می‌آوریم؛ وگرنه اگر کلاینت چت فوکوس
+                # گرفته باشد، چسباندن در پنجره‌ی اشتباه انجام می‌شود.
+                focused = _refocus_target(session)
                 await asyncio.to_thread(mouse.set_text, text)
             except Exception as exc:
                 logger.exception("چسباندن متن در حالت ماوس ناموفق بود")
@@ -2008,9 +2023,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             preview = text if len(text) <= 40 else text[:40] + "…"
+            note = ""
+            if not focused and int(session.get("target_hwnd") or 0):
+                note = "\n⚠️ پنجره‌ی هدف جلو نیامد؛ اگر متن جا نیفتاد، دوباره تلاش کن یا از «🗂 پنجره‌ها» انتخابش کن."
+            elif not int(session.get("target_hwnd") or 0):
+                note = "\n⚠️ پنجره‌ی هدف مشخص نیست؛ اول روی مقصد کلیک کن یا از «🗂 پنجره‌ها» انتخابش کن."
             await _safe_reply(
                 update.effective_message,
-                f"⌨️ چسبانده شد: {preview}",
+                f"⌨️ چسبانده شد: {preview}{note}",
                 reply_markup=ui.main_menu(),
             )
             if mode == _MOUSE_TYPE_MODE:
@@ -2018,7 +2038,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 session["mode"] = ""
                 await _mouse_caption_by_id(
                     update, context, session,
-                    "✅ متن در مکان سلکت‌شده چسبانده شد.",
+                    "✅ متن در مکان سلکت‌شده چسبانده شد." + (("\n" + note.strip()) if note else ""),
                 )
             else:
                 await _mouse_refresh(update, context, session)

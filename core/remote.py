@@ -984,7 +984,7 @@ class RemoteConsole:
             self._target_hwnd = h
             self._since_remember = 0
 
-    def _maybe_remember_target(self) -> None:
+    def _maybe_remember_target(self, settle: float = 0.0) -> None:
         """
         ثبت هدف پنجره؛ فوراً اگر هدف نامعلوم/نامعتبر است، وگرنه هر چند فرمان یک‌بار.
 
@@ -993,27 +993,45 @@ class RemoteConsole:
         فرمان یک‌بار تازه می‌شود. اما اولین کلیک پس از شروع/از دست رفتن هدف
         باید حتماً ثبت شود، وگرنه refocus و چسباندن متن (کنسول ریموت) به
         پنجره‌ی درست نمی‌رسد.
+
+        settle: مکث کوتاه پیش از خواندن پنجره‌ی فعال. بعد از کلیک/درگ،
+        ویندوز ممکن است با تأخیر پنجره‌ی زیر نشانگر را فعال کند؛ بدون این
+        مکث، پنجره‌ی قبلی (مثلاً مرورگر کنسول ریموت) به‌اشتباه هدف ثبت می‌شود.
         """
         h = self._target_hwnd
         if not h or not windows.is_window(h):
+            if settle > 0:
+                time.sleep(settle)
             self._remember_target()
             return
         self._since_remember += 1
         every = max(1, int(getattr(config, "REMOTE_REMEMBER_EVERY", 5)))
         if self._since_remember >= every:
+            if settle > 0:
+                time.sleep(settle)
             self._remember_target()
 
-    def _refocus_target(self) -> None:
+    def _refocus_target(self) -> bool:
         """
         قبل از کلید/ترکیب/متن، هدف را جلو می‌آورد.
 
-        اگر مرورگر (یا تلگرام دسکتاپ) روی همین PC فوکوس گرفته باشد،
-        شورتکات به جای پنجره‌ی مقصد به همان می‌خورد؛ بدون این مرحله
-        Ctrl+C در تلگرام «کپی» می‌شود نه در برنامه‌ی هدف.
+        اگر هدف شناخته‌شده باشد و پنجره‌ی دیگری (مثلاً مرورگر/تلگرام روی
+        همین PC) فوکوس گرفته باشد، هدف دوباره جلو آورده می‌شود تا ورودی به
+        پنجره‌ی درست برسد. اگر هدفی شناخته نشده باشد، دست نمی‌زنیم (تا پنجره‌ی
+        کلاینتِ کنترل به‌اشتباه به‌عنوان هدف ثبت نشود) و ورودی به پنجره‌ی فعال
+        فعلی ارسال می‌شود.
         """
         h = self._target_hwnd
-        if h and windows.is_window(h) and not windows.is_foreground(h):
-            windows.bring_to_front(h)
+        if not h or not windows.is_window(h):
+            self._target_hwnd = 0
+            return False
+        if windows.is_foreground(h):
+            return True
+        ok = windows.bring_to_front(h)
+        if ok:
+            # فرصت کوتاه برای اعمال فوکوس قبل از ارسال کلید/متن
+            time.sleep(0.03)
+        return ok
 
     def do_mouse(self, data: dict) -> None:
         action = str(data.get("action", ""))
@@ -1038,17 +1056,18 @@ class RemoteConsole:
                 return
             if action == "down":
                 mouse.hold(pause=pause)
-                self._maybe_remember_target()
+                # مکث اضافی تا پنجره‌ی زیر نشانگر فرصت فعال شدن داشته باشد
+                self._maybe_remember_target(settle=0.12)
                 return
             if action == "up":
                 mouse.release(pause=pause)
-                self._maybe_remember_target()
+                self._maybe_remember_target(settle=0.12)
                 return
             kind = str(data.get("kind") or "left")
             if kind not in mouse.CLICKS:
                 raise ValueError("نوع کلیک نامعتبر")
             mouse.click(kind, pause=pause)
-            self._maybe_remember_target()
+            self._maybe_remember_target(settle=0.12)
             return
         raise ValueError("عملیات نامعتبر")
 

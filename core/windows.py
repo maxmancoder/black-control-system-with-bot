@@ -169,14 +169,15 @@ def bring_to_front(hwnd: int) -> bool:
     """
     پنجره را فقط جلو می‌آورد؛ بدون maximize.
 
-    برای « refocus قبل از فرستادن کلید/ترکیب » لازم است: اگر تلگرام
-    دسکتاپ روی همین کامپیوتر فوکوس گرفته باشد، Ctrl+C به جای مقصد
-    به تلگرام می‌خورد. focus() اینجا قابل استفاده نیست چون پنجره را
+    برای «refocus قبل از فرستادن کلید/ترکیب/متن» لازم است: اگر مرورگر یا
+    تلگرام دسکتاپ روی همین کامپیوتر فوکوس گرفته باشد، ورودی به جای مقصد
+    به همان می‌خورد. focus() اینجا قابل استفاده نیست چون پنجره را
     maximize می‌کند و اندازه‌ی پنجره‌ی هدف را به هم می‌زند.
 
     ویندوز از پروسه‌ی پس‌زمینه (مثل بات) اجازه‌ی SetForegroundWindow
-    نمی‌دهد مگر اینکه «قفل فوکوس» باز شود؛ تریک کلید ALT این قفل را
-    می‌شکند. بدون آن، خطا می‌دهد و پنجره جلو نمی‌آید.
+    نمی‌دهد مگر اینکه «قفل فوکوس» باز شود. چند ترفند ترکیبی استفاده
+    می‌شود (ALT، AttachThreadInput، SwitchToThisWindow، AllowSetForegroundWindow)
+    و چند بار تلاش می‌شود، چون یک تلاش روی سیستم‌های مختلف کافی نیست.
     """
     if not _HAS_WIN32 or not hwnd:
         return False
@@ -189,25 +190,65 @@ def bring_to_front(hwnd: int) -> bool:
         # روی پنجره‌ی minimize جواب نمی‌دهد
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            time.sleep(0.1)
-        # تریک ALT: فشار و رها کردن کلید ALT قفل فوکوس ویندوز را باز می‌کند
-        # و به پروسه‌ی پس‌زمینه اجازه می‌دهد SetForegroundWindow بزند
-        _unlock_foreground()
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            _force_foreground(hwnd)
-        time.sleep(0.15)
-        if win32gui.GetForegroundWindow() == hwnd:
-            return True
-        # تلاش دوم با تریک SwitchToThisWindow (تحمل بیشتری نسبت به
-        # SetForegroundWindow در برابر قفل فوکوس دارد)
-        try:
-            ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
-            time.sleep(0.15)
-        except Exception:
-            pass
-        return win32gui.GetForegroundWindow() == hwnd
+            time.sleep(0.12)
+        else:
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            except Exception:
+                pass
+
+        user32 = ctypes.windll.user32
+
+        def _try_activate() -> bool:
+            _unlock_foreground()
+            # آوردن پنجره به بالای Z-order (کمک به SetForegroundWindow)
+            try:
+                user32.SetWindowPos(
+                    hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001  # HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE
+                )
+                user32.SetWindowPos(
+                    hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001  # HWND_NOTOPMOST, SWP_NOMOVE|SWP_NOSIZE
+                )
+            except Exception:
+                pass
+            try:
+                win32gui.BringWindowToTop(hwnd)
+            except Exception:
+                pass
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            # حتی اگر خطا نداد، ممکن است موفق نشده باشد؛ تلاش قوی‌تر
+            if not is_foreground(hwnd):
+                try:
+                    _force_foreground(hwnd)
+                except Exception:
+                    pass
+            if not is_foreground(hwnd):
+                try:
+                    user32.SwitchToThisWindow(hwnd, True)
+                except Exception:
+                    pass
+            # تکرار نهایی SetForegroundWindow بعد از ترفندها
+            if not is_foreground(hwnd):
+                _unlock_foreground()
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            return is_foreground(hwnd)
+
+        for wait in (0.04, 0.08, 0.12, 0.18, 0.25):
+            if _try_activate():
+                return True
+            time.sleep(wait)
+            if is_foreground(hwnd):
+                return True
+        # تلاش نهایی: تکرار پس از یک مکث بیشتر
+        _try_activate()
+        time.sleep(0.12)
+        return is_foreground(hwnd)
     except Exception:
         logger.exception("bring_to_front ناموفق بود")
         return False
@@ -278,15 +319,43 @@ def _force_foreground(hwnd: int) -> None:
     fg_thread, _pid2 = win32process.GetWindowThreadProcessId(fg)
 
     user32 = ctypes.windll.user32
-    user32.AttachThreadInput(cur_thread, target_thread, True)
-    user32.AttachThreadInput(cur_thread, fg_thread, True)
+    attached_fg = attached_target = False
     try:
-        win32gui.BringWindowToTop(hwnd)
-        win32gui.SetForegroundWindow(hwnd)
-        win32gui.SetActiveWindow(hwnd)
+        if fg_thread != cur_thread:
+            attached_fg = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
+        if target_thread != cur_thread and target_thread != fg_thread:
+            attached_target = bool(user32.AttachThreadInput(cur_thread, target_thread, True))
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        except Exception:
+            pass
+        try:
+            win32gui.BringWindowToTop(hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            win32gui.SetActiveWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            user32.SetFocus(hwnd)
+        except Exception:
+            pass
     finally:
-        user32.AttachThreadInput(cur_thread, fg_thread, False)
-        user32.AttachThreadInput(cur_thread, target_thread, False)
+        if attached_target:
+            try:
+                user32.AttachThreadInput(cur_thread, target_thread, False)
+            except Exception:
+                pass
+        if attached_fg:
+            try:
+                user32.AttachThreadInput(cur_thread, fg_thread, False)
+            except Exception:
+                pass
 
 
 def _unlock_foreground() -> None:
